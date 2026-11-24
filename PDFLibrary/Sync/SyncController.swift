@@ -249,18 +249,18 @@ final class SyncController {
         let database = container.privateCloudDatabase
         downloadTask = Task { [weak self] in
             defer { self?.downloadTask = nil }
+            // One attempt per missing document per pass, oldest first; failures wait for the next trigger.
+            var attempted: Set<UUID> = []
             while let self, !Task.isCancelled {
-                let next = self.library.missingFiles.first { !self.downloadsInFlight.contains($0.id) && $0.downloadError == nil }
-                    ?? self.library.missingFiles.first { !self.downloadsInFlight.contains($0.id) }
-                guard let entry = next, !self.attempted.contains(entry.id) else { break }
-                self.attempted.insert(entry.id)
+                let candidates = self.library.missingFiles
+                    .filter { !attempted.contains($0.id) && !self.downloadsInFlight.contains($0.id) }
+                    .sorted { $0.createdAt < $1.createdAt }
+                guard let entry = candidates.first else { break }
+                attempted.insert(entry.id)
                 await self.download(entry.id, database: database)
             }
-            self?.attempted = []
         }
     }
-
-    @ObservationIgnored private var attempted: Set<UUID> = []
 
     private func download(_ id: UUID, database: CKDatabase) async {
         downloadsInFlight.insert(id)
