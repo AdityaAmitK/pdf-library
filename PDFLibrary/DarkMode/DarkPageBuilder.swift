@@ -8,14 +8,25 @@ import Foundation
 /// XObjects, rewritten by `TextRecolorRewriter`. The source file is never modified.
 struct DarkPageBuilder {
     enum Outcome {
-        /// `scanLike`: the page draws an image but no PDF text, so any text on it is part of the image
-        /// and keeps its original colors.
-        case derived(Data, scanLike: Bool)
+        case derived(Data)
+        /// The page draws an image but no PDF text (a scan): any text on it is part of the image, so the
+        /// original page is drawn unchanged.
+        case scan
         /// The page uses something this renderer can't reproduce faithfully; draw the original page.
         case unsupported(String)
     }
 
     static func build(page: CGPDFPage) -> Outcome {
+        // Copy only the resources the content names (shared resource dictionaries can hold every image of a
+        // book). A form XObject without its own resources uses the page's, with names not known up front:
+        // then copy everything.
+        if let outcome = build(page: page, copyAllResources: false) { return outcome }
+        return build(page: page, copyAllResources: true)
+            ?? .unsupported("The page's resources couldn't be resolved.")
+    }
+
+    /// Nil when a form XObject needs the page's full resources (only when `copyAllResources` is false).
+    private static func build(page: CGPDFPage, copyAllResources: Bool) -> Outcome? {
         guard let pageDict = page.dictionary else { return .unsupported("The page has no dictionary.") }
         var writer = ObjectWriter()
         let resources = inherited("Resources", in: pageDict).flatMap(dictionaryValue)
@@ -24,9 +35,6 @@ struct DarkPageBuilder {
 
         guard let contents = pageContents(pageDict) else {
             return .unsupported("The page's drawing instructions couldn't be decoded.")
-        }
-        if usesType3GlyphColors(resources) {
-            return .unsupported("This page uses Type 3 font glyphs that set their own colors.")
         }
         let rewriter = TextRecolorRewriter(
             resolveColorSpace: { ColorSpaceResolver.resolve($0, resources: resources) },
@@ -37,16 +45,24 @@ struct DarkPageBuilder {
         } catch {
             return .unsupported("The page's drawing instructions couldn't be read.")
         }
+        if usesType3GlyphColors(resources, fonts: rewritten.usedResources["Font"] ?? []) {
+            return .unsupported("This page uses Type 3 font glyphs that set their own colors.")
+        }
 
         writer.pageResources = resources
-        let resourcesData = resources.map { writer.serialize(dictionary: $0, depth: 0) } ?? Data("<<>>".utf8)
+        writer.copyAllResources = copyAllResources
+        let resourcesData = resources.map {
+            writer.serialize(resources: $0, used: rewritten.usedResources, depth: 0)
+        } ?? Data("<<>>".utf8)
+        if writer.formNeedsPageResources && !copyAllResources { return nil }
         if let problem = writer.unsupported { return .unsupported(problem) }
         if rewritten.usesOptionalContent || writer.usesOptionalContent {
             // Layer visibility lives in the source catalog; drawing a copy without it could show hidden layers.
             return .unsupported("This page has optional layers.")
         }
-        let scanLike = !rewritten.hasVisibleText && !writer.formsHaveVisibleText
-            && (writer.sawImage || rewritten.drawsInlineImage)
+        if !rewritten.hasVisibleText && !writer.formsHaveVisibleText && (writer.sawImage || rewritten.drawsInlineImage) {
+            return .scan
+        }
 
         let contentsNumber = writer.addStream(dictionary: Data(), data: rewritten.data)
         var pageObject = Data("<< /Type /Page /Parent 2 0 R".utf8)
@@ -58,7 +74,7 @@ struct DarkPageBuilder {
             pageObject.append(writer.serialize(object: group, depth: 0))
         }
         pageObject.append(Data(" /Contents \(contentsNumber) 0 R >>".utf8))
-        return .derived(writer.document(pageObject: pageObject), scanLike: scanLike)
+        return .derived(writer.document(pageObject: pageObject))
     }
 
     // MARK: Page helpers
@@ -113,19 +129,20 @@ struct DarkPageBuilder {
     }
 
     /// Type 3 glyphs declared with `d0` paint in their own colors, which the recolorer doesn't rewrite.
-    private static func usesType3GlyphColors(_ resources: CGPDFDictionaryRef?) -> Bool {
-        guard let resources else { return false }
+    /// Checks the fonts in `fonts` (the names a content stream uses).
+    fileprivate static func usesType3GlyphColors(_ resources: CGPDFDictionaryRef?, fonts used: Set<String>) -> Bool {
+        guard let resources, !used.isEmpty else { return false }
         var fonts: CGPDFDictionaryRef?
         guard CGPDFDictionaryGetDictionary(resources, "Font", &fonts), let fonts else { return false }
-        var found = false
-        withUnsafeMutablePointer(to: &found) { pointer in
-            CGPDFDictionaryApplyBlock(fonts, { _, value, info in
-                var font: CGPDFDictionaryRef?
-                var subtype: UnsafePointer<CChar>?
-                var procs: CGPDFDictionaryRef?
-                guard CGPDFObjectGetValue(value, .dictionary, &font), let font,
-                      CGPDFDictionaryGetName(font, "Subtype", &subtype), let subtype, String(cString: subtype) == "Type3",
-                      CGPDFDictionaryGetDictionary(font, "CharProcs", &procs), let procs else { return true }
+        for name in used {
+            var font: CGPDFDictionaryRef?
+            var subtype: UnsafePointer<CChar>?
+            var procs: CGPDFDictionaryRef?
+            guard CGPDFDictionaryGetDictionary(fonts, name, &font), let font,
+                  CGPDFDictionaryGetName(font, "Subtype", &subtype), let subtype, String(cString: subtype) == "Type3",
+                  CGPDFDictionaryGetDictionary(font, "CharProcs", &procs), let procs else { continue }
+            var found = false
+            withUnsafeMutablePointer(to: &found) { pointer in
                 CGPDFDictionaryApplyBlock(procs, { _, proc, info in
                     var stream: CGPDFStreamRef?
                     guard CGPDFObjectGetValue(proc, .stream, &stream), let stream,
@@ -136,11 +153,11 @@ struct DarkPageBuilder {
                         return false
                     }
                     return true
-                }, info)
-                return info?.assumingMemoryBound(to: Bool.self).pointee != true
-            }, pointer)
+                }, pointer)
+            }
+            if found { return true }
         }
-        return found
+        return false
     }
 
     static func decoded(_ stream: CGPDFStreamRef) -> Data? {
@@ -204,6 +221,15 @@ private struct ObjectWriter {
     var formsHaveVisibleText = false
     var sawImage = false
     var usesOptionalContent = false
+    /// Copy whole resource dictionaries instead of only the names the content uses.
+    var copyAllResources = false
+    /// A form XObject without its own /Resources (it uses the page's), so the page's names aren't enough.
+    var formNeedsPageResources = false
+    /// Nonzero while copying a soft mask: its forms define opacity and must stay byte-for-byte.
+    private var verbatimDepth = 0
+    private var rewrittenStreams: Set<UnsafeRawPointer> = []
+    private var verbatimStreams: Set<UnsafeRawPointer> = []
+    private static let filteredCategories: Set<String> = ["Font", "XObject", "ExtGState", "Pattern", "Shading"]
     var pageResources: CGPDFDictionaryRef?
 
     static func number(_ value: Double) -> String {
@@ -299,11 +325,59 @@ private struct ObjectWriter {
         return out
     }
 
+    /// A resource dictionary, keeping only the named entries the content stream uses in the categories
+    /// that can hold large objects. Other categories (color spaces, properties) are small and copied whole.
+    mutating func serialize(resources: CGPDFDictionaryRef, used: [String: Set<String>], depth: Int) -> Data {
+        guard !copyAllResources else { return serialize(dictionary: resources, depth: depth) }
+        var out = Data("<<".utf8)
+        for (category, value) in Self.entries(of: resources) where category != "Parent" {
+            out.append(Data(" \(Self.name(category)) ".utf8))
+            var subdict: CGPDFDictionaryRef?
+            if Self.filteredCategories.contains(category), CGPDFObjectGetValue(value, .dictionary, &subdict), let subdict {
+                let names = used[category] ?? []
+                var inner = Data("<<".utf8)
+                for (name, object) in Self.entries(of: subdict) where names.contains(name) {
+                    inner.append(Data(" \(Self.name(name)) ".utf8))
+                    inner.append(serialize(object: object, depth: depth + 2))
+                }
+                inner.append(Data(" >>".utf8))
+                out.append(inner)
+            } else {
+                out.append(serialize(object: value, depth: depth + 1))
+            }
+        }
+        out.append(Data(" >>".utf8))
+        return out
+    }
+
+    private static func entries(of dictionary: CGPDFDictionaryRef) -> [(String, CGPDFObjectRef)] {
+        var entries: [(String, CGPDFObjectRef)] = []
+        withUnsafeMutablePointer(to: &entries) { pointer in
+            CGPDFDictionaryApplyBlock(dictionary, { key, value, info in
+                info?.assumingMemoryBound(to: [(String, CGPDFObjectRef)].self).pointee.append((String(cString: key), value))
+                return true
+            }, pointer)
+        }
+        return entries.sorted { $0.0 < $1.0 }
+    }
+
+    /// A soft mask dictionary (`/S /Luminosity` or `/Alpha` with a `/G` form).
+    private static func isSoftMask(_ dict: CGPDFDictionaryRef) -> Bool {
+        var s: UnsafePointer<CChar>?
+        var g: CGPDFStreamRef?
+        guard CGPDFDictionaryGetName(dict, "S", &s), let s, CGPDFDictionaryGetStream(dict, "G", &g) else { return false }
+        let kind = String(cString: s)
+        return kind == "Luminosity" || kind == "Alpha"
+    }
+
     mutating func serialize(dictionary: CGPDFDictionaryRef, depth: Int, skip: Set<String> = []) -> Data {
         let key = unsafeBitCast(dictionary, to: UnsafeRawPointer.self)
         guard !ancestors.contains(key) else { return Data("null".utf8) }
         ancestors.insert(key)
         defer { ancestors.remove(key) }
+        let softMask = Self.isSoftMask(dictionary)
+        if softMask { verbatimDepth += 1 }
+        defer { if softMask { verbatimDepth -= 1 } }
         var entries: [(String, CGPDFObjectRef)] = []
         withUnsafeMutablePointer(to: &entries) { pointer in
             CGPDFDictionaryApplyBlock(dictionary, { key, value, info in
@@ -324,7 +398,13 @@ private struct ObjectWriter {
     /// several forms) are written once.
     mutating func serialize(stream: CGPDFStreamRef, depth: Int) -> Int {
         let key = unsafeBitCast(stream, to: UnsafeRawPointer.self)
-        if let number = streamNumbers[key] { return number }
+        if let number = streamNumbers[key] {
+            // One form used both as a soft mask (verbatim) and as artwork (recolored) can't be both.
+            if (verbatimDepth > 0 && rewrittenStreams.contains(key)) || (verbatimDepth == 0 && verbatimStreams.contains(key)) {
+                unsupported = "A drawing group on this page is also used as a transparency mask."
+            }
+            return number
+        }
         let number = nextNumber
         nextNumber += 1
         streamNumbers[key] = number
@@ -350,10 +430,24 @@ private struct ObjectWriter {
         var data = cfData as Data
         var extra = ""
         var skip: Set<String> = ["Length", "Filter", "DecodeParms", "DL"]
+        var formResources: Data?
         switch format {
         case .raw:
             if Self.isForm(dict) {
-                data = rewriteForm(data, dict: dict)
+                if verbatimDepth > 0 {
+                    verbatimStreams.insert(key)
+                } else {
+                    rewrittenStreams.insert(key)
+                    let used: [String: Set<String>]
+                    (data, used) = rewriteForm(data, dict: dict)
+                    var own: CGPDFDictionaryRef?
+                    if CGPDFDictionaryGetDictionary(dict, "Resources", &own), let own {
+                        skip.insert("Resources")
+                        formResources = serialize(resources: own, used: used, depth: depth + 1)
+                    } else {
+                        formNeedsPageResources = true
+                    }
+                }
             }
         case .jpegEncoded:
             extra = " /Filter /DCTDecode"
@@ -372,6 +466,10 @@ private struct ObjectWriter {
             return number
         }
         dictData.removeLast(2)
+        if let formResources {
+            dictData.append(Data(" /Resources ".utf8))
+            dictData.append(formResources)
+        }
         var object = dictData
         object.append(Data("\(extra) /Length \(data.count) >>\nstream\n".utf8))
         object.append(data)
@@ -380,7 +478,7 @@ private struct ObjectWriter {
         return number
     }
 
-    private mutating func rewriteForm(_ data: Data, dict: CGPDFDictionaryRef) -> Data {
+    private mutating func rewriteForm(_ data: Data, dict: CGPDFDictionaryRef) -> (Data, [String: Set<String>]) {
         var resources: CGPDFDictionaryRef?
         let formResources = CGPDFDictionaryGetDictionary(dict, "Resources", &resources) ? resources : pageResources
         let rewriter = TextRecolorRewriter(
@@ -388,12 +486,15 @@ private struct ObjectWriter {
             pageBox: nil)
         guard let result = try? rewriter.rewrite(data) else {
             unsupported = "A drawing group on this page couldn't be read."
-            return data
+            return (data, [:])
+        }
+        if DarkPageBuilder.usesType3GlyphColors(formResources, fonts: result.usedResources["Font"] ?? []) {
+            unsupported = "This page uses Type 3 font glyphs that set their own colors."
         }
         if result.hasVisibleText { formsHaveVisibleText = true }
         if result.drawsInlineImage { sawImage = true }
         if result.usesOptionalContent { usesOptionalContent = true }
-        return result.data
+        return (result.data, result.usedResources)
     }
 
     private static func isForm(_ dict: CGPDFDictionaryRef) -> Bool {

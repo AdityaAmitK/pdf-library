@@ -34,6 +34,15 @@ struct SyncSummary {
             self.init("Offline — changes sync when you’re back online", "wifi.slash", .warning)
         case .available where sync.isSyncing || !sync.downloadsInFlight.isEmpty:
             self.init("Syncing with iCloud…", "arrow.triangle.2.circlepath.icloud", .busy)
+        case .available where !sync.library.missingFiles.isEmpty:
+            // Nothing is transferring right now, but some PDFs still aren't on this device.
+            let count = sync.library.missingFiles.count
+            self.init(count == 1 ? "1 PDF waiting to download" : "\(count) PDFs waiting to download",
+                      "icloud.and.arrow.down", .warning, retry: true)
+        case .available where sync.library.catalog.documents.values.contains(where: { $0.uploadError != nil }):
+            self.init("Some PDFs couldn’t upload", "exclamationmark.icloud", .warning, retry: true)
+        case .available where sync.library.catalog.documents.values.contains(where: { !$0.pending.isEmpty }):
+            self.init("Waiting to upload changes…", "arrow.triangle.2.circlepath.icloud", .busy, retry: true)
         case .available:
             self.init("Synced with iCloud", "checkmark.icloud", .normal)
         }

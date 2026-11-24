@@ -2,6 +2,7 @@ import SwiftUI
 
 enum SettingsKey {
     static let forcePDFDarkMode = "forcePDFDarkMode"
+    static let appAppearance = "appAppearance"
 }
 
 /// Library actions the focused window offers to the menu bar.
@@ -71,6 +72,29 @@ struct AppCommands: Commands {
             Button("Go to Page…") { reader?.isGoToPagePresented = true }
                 .keyboardShortcut("g", modifiers: [.command, .option])
                 .disabled(reader == nil)
+        }
+    }
+}
+
+/// The app's own appearance, independent of Force PDF Dark Mode (which only affects PDF pages).
+enum AppAppearance: String, CaseIterable, Identifiable {
+    case system, light, dark
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .system: "System"
+        case .light: "Light"
+        case .dark: "Dark"
+        }
+    }
+
+    var colorScheme: ColorScheme? {
+        switch self {
+        case .system: nil
+        case .light: .light
+        case .dark: .dark
         }
     }
 }

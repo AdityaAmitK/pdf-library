@@ -41,7 +41,6 @@ final class SyncController {
     @ObservationIgnored private var downloadTask: Task<Void, Never>?
     @ObservationIgnored private let log = Logger(subsystem: "com.aditya.pdflibrary", category: "sync")
 
-    private static let lastAccountKey = "lastICloudAccount"
     static let activeScopeKey = "activeLibraryScope"
 
     init(library: LibraryStore) {
@@ -83,6 +82,17 @@ final class SyncController {
             Task { await refreshAccount() }
         } else {
             syncNow()
+        }
+    }
+
+    /// Sends queued changes right away, e.g. as the app goes to the background, so the latest reading
+    /// position reaches iCloud before the system suspends the app.
+    func sendPendingChanges() async {
+        guard let engine else { return }
+        do {
+            try await engine.sendChanges()
+        } catch {
+            log.error("Send failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -190,7 +200,6 @@ final class SyncController {
     /// stays on disk, isolated, and returns when the same account signs back in.
     private func deactivate() {
         tearDownEngine()
-        UserDefaults.standard.removeObject(forKey: Self.lastAccountKey)
         UserDefaults.standard.set(LibraryPaths.localScope, forKey: Self.activeScopeKey)
         library.switchScope(to: LibraryPaths.localScope)
     }
@@ -329,8 +338,7 @@ extension SyncController: CKSyncEngineDelegate {
                 status = .noAccount
             case .switchAccounts:
                 // Never fall back to the previous account's identity after a switch.
-                UserDefaults.standard.removeObject(forKey: Self.lastAccountKey)
-                deactivate()
+                        deactivate()
                 await refreshAccount()
             @unknown default:
                 await refreshAccount()
@@ -489,6 +497,7 @@ extension SyncController: CKSyncEngineDelegate {
     private func handleSent(_ sent: CKSyncEngine.Event.SentRecordZoneChanges, syncEngine: CKSyncEngine) {
         var requeue: [CKSyncEngine.PendingRecordZoneChange] = []
         var sawSuccess = false
+        var sawDeleteProblem = false
 
         for record in sent.savedRecords {
             metadata?.store(record)
@@ -516,6 +525,7 @@ extension SyncController: CKSyncEngineDelegate {
             if isTransient(error) || error.code == .zoneBusy || error.code == .limitExceeded {
                 requeue.append(.deleteRecord(recordID))
             } else {
+                sawDeleteProblem = true
                 log.error("Delete of \(recordID.recordName, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
                 problem = error.localizedDescription
             }
@@ -554,7 +564,7 @@ extension SyncController: CKSyncEngineDelegate {
                 problem = failure.error.localizedDescription
             }
         }
-        if sawSuccess, sent.failedRecordSaves.isEmpty { problem = nil }
+        if sawSuccess, sent.failedRecordSaves.isEmpty, !sawDeleteProblem { problem = nil }
         if !requeue.isEmpty { syncEngine.state.add(pendingRecordZoneChanges: requeue) }
     }
 
@@ -578,7 +588,13 @@ extension SyncController: CKSyncEngineDelegate {
             guard let remote = CloudRecords.position(from: server) else { return true }
             switch library.applyRemotePosition(id, remote) {
             case .applied: return false
-            case .ignored: return library.entry(id)?.pageModifiedAt != remote.modifiedAt
+            case .ignored:
+                if library.entry(id)?.pageModifiedAt == remote.modifiedAt {
+                    // The server already has exactly this checkpoint.
+                    library.markSynced(id, records: .position, pageModifiedAt: remote.modifiedAt)
+                    return false
+                }
+                return true
             case .rejectedByTombstone: return false
             }
         case .file:

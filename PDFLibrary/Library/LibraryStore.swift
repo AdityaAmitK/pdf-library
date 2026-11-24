@@ -80,6 +80,7 @@ final class LibraryStore {
         } else {
             catalog = Catalog()
         }
+        removeUnreferencedFiles()
         refreshLocalFiles()
         cleanStaging()
     }
@@ -87,6 +88,17 @@ final class LibraryStore {
     private func refreshLocalFiles() {
         let fm = FileManager.default
         localFiles = Set(catalog.documents.keys.filter { fm.fileExists(atPath: paths.fileURL(for: $0).path) })
+    }
+
+    /// Files whose document isn't in the catalog: deleted documents whose removal was interrupted, or a
+    /// copy whose catalog write never happened. Nothing references them, so they only waste space.
+    private func removeUnreferencedFiles() {
+        let fm = FileManager.default
+        for url in (try? fm.contentsOfDirectory(at: paths.filesDirectory, includingPropertiesForKeys: nil)) ?? [] {
+            guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
+                  catalog.documents[id] == nil else { continue }
+            try? fm.removeItem(at: url)
+        }
     }
 
     private func cleanStaging() {
@@ -102,8 +114,6 @@ final class LibraryStore {
     /// must not delete files or publish changes to iCloud for state that isn't on disk.
     @discardableResult
     func save() -> Bool {
-        saveTask?.cancel()
-        saveTask = nil
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
@@ -128,9 +138,15 @@ final class LibraryStore {
 
     /// Writes any pending position checkpoint now (app backgrounding, reader closing, scope switch).
     func flushPendingSave() {
+        saveTask?.cancel()
+        saveTask = nil
         let ids = positionsAwaitingSave
+        guard !ids.isEmpty else { return }
+        guard save() else {
+            scheduleSave()  // retry the checkpoint; positions stay queued
+            return
+        }
         positionsAwaitingSave = []
-        save()
         for id in ids where catalog.documents[id] != nil {
             changeSink?.libraryNeedsSave(id, records: .position)
         }
@@ -184,9 +200,15 @@ final class LibraryStore {
     func importFiles(_ urls: [URL]) async {
         var failures: [String] = []
         var duplicates: [String] = []
-        for url in urls {
-            let staging = paths.stagingDirectory
-            let scope = paths.scope
+        let staging = paths.stagingDirectory
+        let scope = paths.scope
+        for (index, url) in urls.enumerated() {
+            guard paths.scope == scope else {
+                // The iCloud account changed during this import: none of the rest joins the other library.
+                let rest = urls[index...].map(\.lastPathComponent).joined(separator: ", ")
+                failures.append("\(rest): the iCloud account changed during import. Import again.")
+                break
+            }
             do {
                 let prepared = try await Task.detached(priority: .userInitiated) {
                     try PDFImporter.prepare(url, stagingDirectory: staging)
@@ -248,7 +270,20 @@ final class LibraryStore {
         var adopted: [UUID] = []
         var redundant: [UUID] = []   // already in this library (same bytes): the local copy can go
         for (id, var entry) in source.documents {
-            if catalog.documents[id] != nil || catalog.documents.values.contains(where: { $0.sha256 == entry.sha256 }) {
+            let match = catalog.documents[id] ?? catalog.documents.values.first { $0.sha256 == entry.sha256 }
+            if let match {
+                // Same bytes already known here. Keep the local copy unless this library has its file; if it
+                // doesn't yet (still downloading), give it these bytes first.
+                if !localFiles.contains(match.id) {
+                    let target = paths.fileURL(for: match.id)
+                    guard (try? fm.copyItem(at: other.fileURL(for: id), to: target)) != nil,
+                          (try? PDFImporter.sha256(of: target)) == match.sha256 else {
+                        try? fm.removeItem(at: target)
+                        continue
+                    }
+                    localFiles.insert(match.id)
+                    catalog.documents[match.id]?.downloadError = nil
+                }
                 redundant.append(id)
                 continue
             }
@@ -344,12 +379,13 @@ final class LibraryStore {
 
     /// Removes every document locally (the user deleted this app's data from iCloud settings).
     func removeAllDocuments() {
-        for id in catalog.documents.keys {
-            try? FileManager.default.removeItem(at: paths.fileURL(for: id))
-        }
+        let ids = Array(catalog.documents.keys)
         catalog = Catalog()
         localFiles = []
-        save()
+        guard save() else { return }  // files stay; unreferenced ones are removed at next launch
+        for id in ids {
+            try? FileManager.default.removeItem(at: paths.fileURL(for: id))
+        }
     }
 
     // MARK: Remote changes (called by SyncController)
@@ -407,14 +443,18 @@ final class LibraryStore {
         catalog.orphanPositions[id] = nil
         if catalog.tombstones[id] == nil { catalog.tombstones[id] = Date() }
         positionsAwaitingSave.remove(id)
-        try? FileManager.default.removeItem(at: paths.fileURL(for: id))
         localFiles.remove(id)
-        save()
+        // Remove the bytes only once the tombstone is on disk. If the write fails, the in-memory tombstone
+        // reaches disk with the next successful save and the file is removed at the next launch.
+        guard save() else { return }
+        try? FileManager.default.removeItem(at: paths.fileURL(for: id))
     }
 
     /// Copies a downloaded asset (CloudKit's staging file, which may vanish) into durable storage.
     func installRemoteFile(_ id: UUID, from stagedURL: URL, sha256: String?) async -> Bool {
-        guard catalog.tombstones[id] == nil else { return false }
+        // Only for documents in the catalog: a file that arrives before its Document record is fetched
+        // again by the download pass once the document exists, so no unreferenced file is ever kept.
+        guard catalog.tombstones[id] == nil, catalog.documents[id] != nil else { return false }
         if localFiles.contains(id) { return true }
         let destination = paths.fileURL(for: id)
         let staging = paths.stagingDirectory

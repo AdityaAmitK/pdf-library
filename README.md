@@ -1,8 +1,8 @@
-<img src="assets/icon.svg" width="64" height="64" alt="">
+<img src="assets/icon.png" width="64" height="64" alt="">
 
 # PDF Library
 
-A personal PDF reader for Mac, iPhone and iPad. One private iCloud library: every device keeps a local copy of every PDF, opens at the last page read, and syncs renames and deletions. Includes a forced PDF dark mode that recolors text but keeps images and artwork in their original colors.
+A personal PDF reader for Mac, iPhone and iPad. One private iCloud library: every device keeps a local copy of every PDF, opens at the last page read, and syncs renames and deletions. Includes an app appearance setting (System, Light, Dark) and a separate forced PDF dark mode that recolors text but keeps images and artwork in their original colors.
 
 - Build: `xcodegen generate`, then see [docs/SIGNING.md](docs/SIGNING.md).
 - Sync design and CloudKit schema: [docs/CLOUDKIT.md](docs/CLOUDKIT.md).

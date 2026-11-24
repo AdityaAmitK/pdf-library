@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @AppStorage(SettingsKey.forcePDFDarkMode) private var forceDark = false
+    @AppStorage(SettingsKey.appAppearance) private var appearance = AppAppearance.system
     @Environment(AppModel.self) private var model
     #if os(iOS)
     @Environment(\.dismiss) private var dismiss
@@ -10,6 +11,15 @@ struct SettingsView: View {
     var body: some View {
         let summary = SyncSummary(model.sync)
         Form {
+            Section {
+                Picker("Appearance", selection: $appearance) {
+                    ForEach(AppAppearance.allCases) { Text($0.title).tag($0) }
+                }
+            } header: {
+                Text("App")
+            } footer: {
+                Text("Dark uses dark menus, lists and toolbars everywhere in the app. PDF pages stay as they are unless Force PDF Dark Mode is on.")
+            }
             Section {
                 Toggle("Force PDF Dark Mode", isOn: $forceDark)
             } header: {

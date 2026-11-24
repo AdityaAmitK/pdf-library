@@ -1,6 +1,6 @@
 # Forced PDF dark mode
 
-A reader setting (default off, persisted, independent of the system appearance) that shows PDFs on a dark surface with light text while every image and piece of artwork keeps its original colors. The PDF file is never changed.
+A reader setting, separate from the app's own Appearance setting (System, Light, Dark) (default off, persisted, independent of the system appearance) that shows PDFs on a dark surface with light text while every image and piece of artwork keeps its original colors. The PDF file is never changed.
 
 ## Why not a filter
 
@@ -12,7 +12,7 @@ PDFKit and Core Graphics have no option to recolor only text. Inverting the page
 
 The recolored copy (`DarkPageBuilder`) is a one-page PDF built in memory:
 
-1. The page's resources (fonts, images, artwork, form XObjects) are copied object for object through Core Graphics' PDF object model.
+1. The resources the page's content actually names (fonts, images, artwork, form XObjects) are copied object for object through Core Graphics' PDF object model. Forms used as soft masks are copied byte-for-byte, because their luminance defines opacity.
 2. The page's content stream, and each form XObject's, is rewritten by `TextRecolorRewriter`. It works on drawing operators, not pixels. Inside each text object (`BT`…`ET`) color operators are replaced by a light color with the same hue (black → near-white, dark blue → light blue; already-light text is unchanged). The text object is wrapped in `q`/`Q` and the original color and text state are replayed afterwards, so all following artwork draws exactly as before.
 3. A near-white, unclipped rectangle filling most of the page and painted before anything else (the document's own page background) is painted as the dark surface instead. Any later light rectangle is artwork and keeps its color.
 

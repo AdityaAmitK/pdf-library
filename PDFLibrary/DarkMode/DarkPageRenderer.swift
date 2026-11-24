@@ -42,21 +42,20 @@ final class DarkPageRenderer: @unchecked Sendable {
             return markUnsupported(index, "The page couldn't be read.")
         }
         switch DarkPageBuilder.build(page: page) {
-        case .derived(let data, let scanLike):
+        case .derived(let data):
             guard let provider = CGDataProvider(data: data as CFData),
                   let document = CGPDFDocument(provider),
                   let derivedPage = document.page(at: 1) else {
                 return markUnsupported(index, "The recolored page couldn't be assembled.")
             }
-            if scanLike {
-                // A scan has no PDF text to recolor: draw the original (no decoded-image copy in memory).
-                notes[index] = .scan
-                unsupported.insert(index)
-                return .original
-            }
             derived[index] = document
             touch(index)
             return .derived(document, derivedPage)
+        case .scan:
+            // No PDF text to recolor: draw the original (and keep no decoded copy in memory).
+            notes[index] = .scan
+            unsupported.insert(index)
+            return .original
         case .unsupported(let message):
             return markUnsupported(index, message)
         }

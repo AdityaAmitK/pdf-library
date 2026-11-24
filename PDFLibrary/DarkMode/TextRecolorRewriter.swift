@@ -109,6 +109,8 @@ struct TextRecolorRewriter {
         var drawsInlineImage: Bool
         /// Uses optional content (`/OC … BDC`), whose visibility lives in the source document's catalog.
         var usesOptionalContent: Bool
+        /// Resource names the stream refers to, by resource category (Font, XObject, ExtGState, ...).
+        var usedResources: [String: Set<String>]
     }
 
     /// Resolves `/Name cs` color spaces against the stream's resources.
@@ -143,6 +145,10 @@ struct TextRecolorRewriter {
         var usesOptionalContent = false
         /// Something has been painted; a later light rectangle is artwork, not the page background.
         var paintedSomething = false
+        var used: [String: Set<String>] = [:]
+        func use(_ category: String, _ op: ContentOperation) {
+            if case .name(let name) = op.operands.first { used[category, default: []].insert(name) }
+        }
 
         var gs = GraphicsState()
         var stack: [GraphicsState] = []
@@ -232,6 +238,14 @@ struct TextRecolorRewriter {
         }
 
         for op in ops {
+            switch op.name {
+            case "Tf": use("Font", op)
+            case "gs": use("ExtGState", op)
+            case "Do": use("XObject", op)
+            case "sh": use("Shading", op)
+            case "scn", "SCN": if let name = op.lastName { used["Pattern", default: []].insert(name) }
+            default: break
+            }
             if inText {
                 switch op.name {
                 case "ET":
@@ -351,7 +365,7 @@ struct TextRecolorRewriter {
             out.append(replay)
         }
         return Result(data: out, hasVisibleText: hasVisibleText, drawsInlineImage: drawsInlineImage,
-                      usesOptionalContent: usesOptionalContent)
+                      usesOptionalContent: usesOptionalContent, usedResources: used)
     }
 
     /// A single rectangle, filled (not stroked) with a near-white color, covering most of the page: the
