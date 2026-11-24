@@ -138,7 +138,15 @@ final class SyncController {
                 status = .available
             } catch {
                 tearDownEngine()
-                status = .waitingForNetwork
+                log.error("User record ID failed: \(String(describing: error), privacy: .public)")
+                if let ck = error as? CKError, [.networkUnavailable, .networkFailure].contains(ck.code) {
+                    status = .waitingForNetwork
+                } else {
+                    // Not a connectivity problem (e.g. a new container still being set up): say what it is
+                    // and try again shortly.
+                    status = .error("iCloud isn't ready: \(error.localizedDescription)")
+                    scheduleAccountRetry()
+                }
             }
         case .noAccount:
             deactivate()
@@ -153,6 +161,17 @@ final class SyncController {
             status = .error("iCloud status couldn't be determined.")
         @unknown default:
             status = .error("Unknown iCloud status.")
+        }
+    }
+
+    @ObservationIgnored private var accountRetry: Task<Void, Never>?
+
+    private func scheduleAccountRetry() {
+        guard accountRetry == nil else { return }
+        accountRetry = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(30))
+            self?.accountRetry = nil
+            await self?.refreshAccount()
         }
     }
 
@@ -325,6 +344,9 @@ extension SyncController: CKSyncEngineDelegate {
         guard syncEngine === engine else { return }  // an engine from a previous account
         switch event {
         case .stateUpdate(let update):
+            // If fetched changes couldn't be written to the catalog, keep the previous change token so
+            // they are fetched again rather than lost.
+            guard !library.hasUnsavedChanges else { break }
             if let data = try? PropertyListEncoder().encode(update.stateSerialization) {
                 try? data.write(to: library.paths.syncStateURL, options: [.atomic])
             }
@@ -338,7 +360,7 @@ extension SyncController: CKSyncEngineDelegate {
                 status = .noAccount
             case .switchAccounts:
                 // Never fall back to the previous account's identity after a switch.
-                        deactivate()
+                deactivate()
                 await refreshAccount()
             @unknown default:
                 await refreshAccount()

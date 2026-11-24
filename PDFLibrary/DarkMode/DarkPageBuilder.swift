@@ -8,7 +8,8 @@ import Foundation
 /// XObjects, rewritten by `TextRecolorRewriter`. The source file is never modified.
 struct DarkPageBuilder {
     enum Outcome {
-        case derived(Data)
+        /// `lowContrastNote`: some text is drawn on light artwork, which keeps its color.
+        case derived(Data, lowContrastNote: Bool)
         /// The page draws an image but no PDF text (a scan): any text on it is part of the image, so the
         /// original page is drawn unchanged.
         case scan
@@ -74,7 +75,7 @@ struct DarkPageBuilder {
             pageObject.append(writer.serialize(object: group, depth: 0))
         }
         pageObject.append(Data(" /Contents \(contentsNumber) 0 R >>".utf8))
-        return .derived(writer.document(pageObject: pageObject))
+        return .derived(writer.document(pageObject: pageObject), lowContrastNote: rewritten.textAfterLightBox)
     }
 
     // MARK: Page helpers

@@ -111,6 +111,8 @@ struct TextRecolorRewriter {
         var usesOptionalContent: Bool
         /// Resource names the stream refers to, by resource category (Font, XObject, ExtGState, ...).
         var usedResources: [String: Set<String>]
+        /// Visible text is drawn after a sizeable light box (artwork, kept light), so it may have low contrast.
+        var textAfterLightBox: Bool
     }
 
     /// Resolves `/Name cs` color spaces against the stream's resources.
@@ -146,6 +148,8 @@ struct TextRecolorRewriter {
         /// Something has been painted; a later light rectangle is artwork, not the page background.
         var paintedSomething = false
         var used: [String: Set<String>] = [:]
+        var lightBoxPainted = false
+        var textAfterLightBox = false
         func use(_ category: String, _ op: ContentOperation) {
             if case .name(let name) = op.operands.first { used[category, default: []].insert(name) }
         }
@@ -225,6 +229,7 @@ struct TextRecolorRewriter {
             } ?? false
             if pathOps.contains(where: { $0.name == "W" || $0.name == "W*" }) { gs.clipped = true }
             if let paint, paint.name != "n" { paintedSomething = true }
+            if let paint, !isBackground, isSizeableLightBox(pathOps, paint: paint, gs: gs) { lightBoxPainted = true }
             if isBackground {
                 let s = DarkPalette.surface
                 out.append(Data(String(format: "q %.4f %.4f %.4f rg\n", s.r, s.g, s.b).utf8))
@@ -269,11 +274,19 @@ struct TextRecolorRewriter {
                     }
                     inText = false
                 case "Tj", "TJ", "'":
-                    if gs.renderMode != 3 && gs.renderMode != 7 { hasVisibleText = true; paintedSomething = true }
+                    if gs.renderMode != 3 && gs.renderMode != 7 {
+                        hasVisibleText = true
+                        paintedSomething = true
+                        if lightBoxPainted { textAfterLightBox = true }
+                    }
                     block.append(raw(op))
                     plainBlock.append(raw(op))
                 case "\"":
-                    if gs.renderMode != 3 && gs.renderMode != 7 { hasVisibleText = true; paintedSomething = true }
+                    if gs.renderMode != 3 && gs.renderMode != 7 {
+                        hasVisibleText = true
+                        paintedSomething = true
+                        if lightBoxPainted { textAfterLightBox = true }
+                    }
                     block.append(raw(op))
                     plainBlock.append(raw(op))
                     let n = op.numbers
@@ -365,7 +378,8 @@ struct TextRecolorRewriter {
             out.append(replay)
         }
         return Result(data: out, hasVisibleText: hasVisibleText, drawsInlineImage: drawsInlineImage,
-                      usesOptionalContent: usesOptionalContent, usedResources: used)
+                      usesOptionalContent: usesOptionalContent, usedResources: used,
+                      textAfterLightBox: textAfterLightBox)
     }
 
     /// A single rectangle, filled (not stroked) with a near-white color, covering most of the page: the
@@ -373,11 +387,24 @@ struct TextRecolorRewriter {
     private func isFullPageLightBackground(_ path: [ContentOperation], paint: ContentOperation, gs: GraphicsState) -> Bool {
         guard let pageBox, ["f", "F", "f*"].contains(paint.name),
               path.count == 1, path[0].name == "re", path[0].numbers.count == 4,
-              let (r, g, b) = gs.fill.rgb, 0.2126 * r + 0.7152 * g + 0.0722 * b >= 0.9 else { return false }
+              let (r, g, b) = gs.fill.rgb, min(r, g, b) >= 0.94, max(r, g, b) - min(r, g, b) <= 0.04 else { return false }
         let n = path[0].numbers
         let rect = CGRect(x: n[0], y: n[1], width: n[2], height: n[3]).standardized.applying(gs.ctm)
         let covered = rect.intersection(pageBox)
         guard !covered.isNull, pageBox.width > 0, pageBox.height > 0 else { return false }
         return (covered.width * covered.height) / (pageBox.width * pageBox.height) >= 0.85
+    }
+
+    /// A filled light rectangle covering at least 2% of the page: light artwork (a callout, a shaded
+    /// table cell) that keeps its color, so light text drawn on it may be hard to read.
+    private func isSizeableLightBox(_ path: [ContentOperation], paint: ContentOperation, gs: GraphicsState) -> Bool {
+        guard let pageBox, ["f", "F", "f*", "B", "B*", "b", "b*"].contains(paint.name),
+              let (r, g, b) = gs.fill.rgb, 0.2126 * r + 0.7152 * g + 0.0722 * b >= 0.8 else { return false }
+        let area = path.filter { $0.name == "re" && $0.numbers.count == 4 }.reduce(0.0) { total, op in
+            let n = op.numbers
+            let rect = CGRect(x: n[0], y: n[1], width: n[2], height: n[3]).standardized.applying(gs.ctm)
+            return total + rect.width * rect.height
+        }
+        return area >= 0.02 * pageBox.width * pageBox.height
     }
 }

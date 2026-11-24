@@ -76,7 +76,7 @@ private struct ReaderContent: View {
                     #endif
                 Button("Go") {
                     if let page = Int(pageText.trimmingCharacters(in: .whitespaces)) {
-                        controller.goToPage(page - 1)
+                        controller.goToPage(min(max(page, 1), max(controller.pageCount, 1)) - 1)
                     }
                 }
                 .keyboardShortcut(.defaultAction)
@@ -178,6 +178,7 @@ private struct PageNoteView: View {
         switch note {
         case .scan: "Scanned page — its text is part of the image and keeps its original colors"
         case .unsupported(let reason): "Shown in original colors: \(reason)"
+        case .lightBoxes: "Some text sits on light boxes that keep their original color and may be hard to read"
         }
     }
 }

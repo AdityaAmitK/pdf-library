@@ -15,6 +15,8 @@ final class DarkPageRenderer: @unchecked Sendable {
         case scan
         /// Drawn in original colors because the page uses something the recolorer can't reproduce.
         case unsupported(String)
+        /// Recolored, but some text sits on light boxes that keep their original color.
+        case lightBoxes
     }
 
     private let source: CGPDFDocument?
@@ -42,12 +44,13 @@ final class DarkPageRenderer: @unchecked Sendable {
             return markUnsupported(index, "The page couldn't be read.")
         }
         switch DarkPageBuilder.build(page: page) {
-        case .derived(let data):
+        case .derived(let data, let lowContrastNote):
             guard let provider = CGDataProvider(data: data as CFData),
                   let document = CGPDFDocument(provider),
                   let derivedPage = document.page(at: 1) else {
                 return markUnsupported(index, "The recolored page couldn't be assembled.")
             }
+            if lowContrastNote { notes[index] = .lightBoxes }
             derived[index] = document
             touch(index)
             return .derived(document, derivedPage)

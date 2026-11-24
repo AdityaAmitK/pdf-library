@@ -22,6 +22,10 @@ final class LibraryStore {
     var notice: LibraryNotice?
 
     @ObservationIgnored weak var changeSink: (any LibraryChangeSink)?
+    /// The last catalog write failed. While true, iCloud's change token isn't saved, so fetched changes
+    /// that didn't reach disk are fetched again on the next launch.
+    @ObservationIgnored private(set) var hasUnsavedChanges = false
+    @ObservationIgnored private var catalogWritable = true
     @ObservationIgnored private var saveTask: Task<Void, Never>?
     @ObservationIgnored private var positionsAwaitingSave: Set<UUID> = []
 
@@ -67,20 +71,32 @@ final class LibraryStore {
         } catch {
             notice = .error("Couldn't prepare library storage: \(error.localizedDescription)")
         }
-        if let data = try? Data(contentsOf: paths.catalogURL) {
+        catalogWritable = true
+        do {
+            let data = try Data(contentsOf: paths.catalogURL)
             do {
                 catalog = try JSONDecoder().decode(Catalog.self, from: data)
             } catch {
-                // Never overwrite an unreadable catalog; keep it aside for recovery.
+                // Keep the unreadable catalog aside; the PDFs stay and are recovered below.
                 let aside = paths.root.appending(path: "catalog-unreadable-\(Int(Date().timeIntervalSince1970)).json")
                 try? FileManager.default.moveItem(at: paths.catalogURL, to: aside)
                 catalog = Catalog()
-                notice = .error("The library catalog was unreadable and was set aside. iCloud will restore synced documents.")
+                notice = .error("The library catalog was unreadable and was set aside. Your PDFs were kept; titles and pages may need restoring from iCloud.")
             }
-        } else {
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            catalog = Catalog()  // a new library
+        } catch {
+            // Can't read it right now (e.g. before first unlock): never write over it this session.
             catalog = Catalog()
+            catalogWritable = false
+            notice = .error("The library couldn't be opened: \(error.localizedDescription). Relaunch the app.")
+            return
         }
-        removeUnreferencedFiles()
+        reconcileFiles()
+        // Unread documents have no position to send.
+        for (id, entry) in catalog.documents where entry.pageModifiedAt == nil && entry.pending.contains(.position) {
+            catalog.documents[id]?.pending.remove(.position)
+        }
         refreshLocalFiles()
         cleanStaging()
     }
@@ -90,15 +106,29 @@ final class LibraryStore {
         localFiles = Set(catalog.documents.keys.filter { fm.fileExists(atPath: paths.fileURL(for: $0).path) })
     }
 
-    /// Files whose document isn't in the catalog: deleted documents whose removal was interrupted, or a
-    /// copy whose catalog write never happened. Nothing references them, so they only waste space.
-    private func removeUnreferencedFiles() {
+    /// PDFs in Files/ without a catalog entry. Deleted documents (tombstoned) are removed. Anything else (an
+    /// import whose catalog write was interrupted, or a library whose catalog was unreadable) is never
+    /// deleted: it is added back as a document so no PDF is lost.
+    private func reconcileFiles() {
         let fm = FileManager.default
-        for url in (try? fm.contentsOfDirectory(at: paths.filesDirectory, includingPropertiesForKeys: nil)) ?? [] {
+        var recovered = false
+        for url in (try? fm.contentsOfDirectory(at: paths.filesDirectory, includingPropertiesForKeys: [.creationDateKey])) ?? [] {
             guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
                   catalog.documents[id] == nil else { continue }
-            try? fm.removeItem(at: url)
+            if catalog.tombstones[id] != nil {
+                try? fm.removeItem(at: url)
+                continue
+            }
+            guard let pageCount = try? PDFImporter.validate(url), let sha = try? PDFImporter.sha256(of: url) else { continue }
+            let size = (try? fm.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
+            let created = (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
+            catalog.documents[id] = DocumentEntry(
+                id: id, title: "Recovered PDF", titleModifiedAt: .distantPast, createdAt: created,
+                byteSize: size, sha256: sha, pageCount: pageCount, pageIndex: 0, pageModifiedAt: nil,
+                fileInCloud: false, pending: [.metadata, .file])
+            recovered = true
         }
+        if recovered { save() }
     }
 
     private func cleanStaging() {
@@ -114,13 +144,19 @@ final class LibraryStore {
     /// must not delete files or publish changes to iCloud for state that isn't on disk.
     @discardableResult
     func save() -> Bool {
+        guard catalogWritable else {
+            hasUnsavedChanges = true
+            return false
+        }
         do {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
             let data = try encoder.encode(catalog)
             try data.write(to: paths.catalogURL, options: [.atomic])
+            hasUnsavedChanges = false
             return true
         } catch {
+            hasUnsavedChanges = true
             notice = .error("Couldn't save the library: \(error.localizedDescription)")
             return false
         }
@@ -220,6 +256,18 @@ final class LibraryStore {
                     continue
                 }
                 if let existing = catalog.documents.values.first(where: { $0.sha256 == prepared.sha256 }) {
+                    if !localFiles.contains(existing.id) {
+                        // Known document whose bytes haven't downloaded yet: use these (same checksum).
+                        do {
+                            try FileManager.default.moveItem(at: prepared.stagedURL, to: paths.fileURL(for: existing.id))
+                            localFiles.insert(existing.id)
+                            setDownloadError(existing.id, nil)
+                        } catch {
+                            try? FileManager.default.removeItem(at: prepared.stagedURL)
+                            failures.append("\(url.lastPathComponent): \(LibraryError.storage(error).localizedDescription)")
+                        }
+                        continue
+                    }
                     try? FileManager.default.removeItem(at: prepared.stagedURL)
                     duplicates.append(existing.title)
                     continue
@@ -248,14 +296,14 @@ final class LibraryStore {
         catalog.documents[id] = DocumentEntry(
             id: id, title: prepared.title, titleModifiedAt: now, createdAt: now,
             byteSize: prepared.byteSize, sha256: prepared.sha256, pageCount: prepared.pageCount,
-            pageIndex: 0, pageModifiedAt: nil, fileInCloud: false, pending: .all)
+            pageIndex: 0, pageModifiedAt: nil, fileInCloud: false, pending: [.metadata, .file])
         guard save() else {
             catalog.documents[id] = nil
             try? FileManager.default.removeItem(at: paths.fileURL(for: id))
             throw LibraryError.catalogNotSaved
         }
         localFiles.insert(id)
-        changeSink?.libraryNeedsSave(id, records: .all)
+        changeSink?.libraryNeedsSave(id, records: [.metadata, .file])
     }
 
     /// Moves every document of `other` (the signed-out local library) into this library.
@@ -284,6 +332,7 @@ final class LibraryStore {
                     localFiles.insert(match.id)
                     catalog.documents[match.id]?.downloadError = nil
                 }
+                mergeNewerProgress(from: entry, into: match.id)
                 redundant.append(id)
                 continue
             }
@@ -296,12 +345,12 @@ final class LibraryStore {
                 continue  // stays in the local library; adoption is retried next time
             }
             entry.fileInCloud = false
-            entry.pending = .all
+            entry.pending = entry.pageModifiedAt == nil ? [.metadata, .file] : .all
             catalog.documents[id] = entry
             localFiles.insert(id)
             adopted.append(id)
         }
-        guard !adopted.isEmpty || !redundant.isEmpty else { return }
+        guard !adopted.isEmpty || !redundant.isEmpty else { mergedIDs = []; return }
         guard save() else {
             for id in adopted {
                 catalog.documents[id] = nil
@@ -315,8 +364,33 @@ final class LibraryStore {
         if let data = try? JSONEncoder().encode(remaining), (try? data.write(to: other.catalogURL, options: [.atomic])) != nil {
             for id in adopted + redundant { try? fm.removeItem(at: other.fileURL(for: id)) }
         }
-        for id in adopted {
-            changeSink?.libraryNeedsSave(id, records: .all)
+        for id in adopted + mergedIDs {
+            if let pending = catalog.documents[id]?.pending { changeSink?.libraryNeedsSave(id, records: pending) }
+        }
+        mergedIDs = []
+    }
+
+    @ObservationIgnored private var mergedIDs: [UUID] = []
+
+    /// Reading done (or a rename made) while signed out wins over the account's older values.
+    private func mergeNewerProgress(from local: DocumentEntry, into id: UUID) {
+        guard var entry = catalog.documents[id] else { return }
+        var changed = false
+        if let localPage = local.pageModifiedAt, localPage > (entry.pageModifiedAt ?? .distantPast) {
+            entry.pageIndex = local.pageIndex
+            entry.pageModifiedAt = localPage
+            entry.pending.insert(.position)
+            changed = true
+        }
+        if local.titleModifiedAt > entry.titleModifiedAt {
+            entry.title = local.title
+            entry.titleModifiedAt = local.titleModifiedAt
+            entry.pending.insert(.metadata)
+            changed = true
+        }
+        if changed {
+            catalog.documents[id] = entry
+            mergedIDs.append(id)
         }
     }
 
@@ -331,6 +405,8 @@ final class LibraryStore {
         entry.pending.subtract(cleared)
         if records.contains(.file) {
             entry.fileInCloud = true
+        }
+        if records.contains(.file) || entry.pending.isEmpty {
             entry.uploadError = nil
         }
         catalog.documents[id] = entry
@@ -469,7 +545,7 @@ final class LibraryStore {
         switch result {
         case .success:
             // The document may have been deleted while the copy ran.
-            if catalog.tombstones[id] != nil {
+            if catalog.tombstones[id] != nil || catalog.documents[id] == nil {
                 try? FileManager.default.removeItem(at: destination)
                 return false
             }
