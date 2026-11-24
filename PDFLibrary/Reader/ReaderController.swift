@@ -150,33 +150,17 @@ final class ReaderController {
         applyBackground()
         refreshNote()
         guard let view = pdfView, view.document != nil else { return }
+        // PDFKit caches drawn page tiles, so the document is reattached to redraw them. The exact scroll
+        // offset and zoom are restored afterwards (a PDFDestination round trip can drift by half a page), and
+        // page changes are ignored until PDFKit has settled.
+        let spot = view.scrollSpot
         let pageIndex = currentPage
-        let destination = view.currentDestination
-        let autoScales = view.autoScales
-        let scale = view.scaleFactor
-        func returnToSpot() {
-            if let destination, let page = destination.page, document.index(for: page) == pageIndex {
-                view.go(to: destination)
-            } else if let page = document.page(at: pageIndex) {
-                view.go(to: page)
-            }
-        }
-        // PDFKit caches drawn page tiles; reattaching the document is the supported way to redraw them.
-        // PDFKit re-lays out the reattached document over the next run loop passes (and may scroll while
-        // doing so), so the spot is re-asserted after that and page changes are ignored until it settles.
         programmaticMoves += 1
         view.document = nil
         view.document = document
-        if autoScales {
-            view.autoScales = true
-        } else {
-            view.scaleFactor = scale
-        }
-        view.layoutDocumentView()
-        returnToSpot()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [self] in
-            view.layoutDocumentView()
-            if visiblePageIndex != pageIndex { returnToSpot() }
+        view.restore(spot)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [self] in
+            view.restore(spot)
             DispatchQueue.main.async { [self] in
                 currentPage = visiblePageIndex ?? pageIndex
                 refreshNote()
@@ -222,6 +206,46 @@ extension PlatformColor {
         NSColor(cgColor: DarkPalette.surfaceColor) ?? .black
         #else
         UIColor(cgColor: DarkPalette.surfaceColor)
+        #endif
+    }
+}
+
+/// The reader's exact scroll position and zoom.
+struct ScrollSpot {
+    var autoScales: Bool
+    var scaleFactor: CGFloat
+    var offset: CGPoint
+}
+
+extension PDFView {
+    #if os(iOS)
+    private var scrollView: UIScrollView? {
+        subviews.lazy.compactMap { $0 as? UIScrollView }.first
+    }
+    #endif
+
+    var scrollSpot: ScrollSpot {
+        #if os(iOS)
+        let offset = scrollView?.contentOffset ?? .zero
+        #else
+        let offset = documentView?.enclosingScrollView?.contentView.bounds.origin ?? .zero
+        #endif
+        return ScrollSpot(autoScales: autoScales, scaleFactor: scaleFactor, offset: offset)
+    }
+
+    func restore(_ spot: ScrollSpot) {
+        if spot.autoScales { autoScales = true } else { scaleFactor = spot.scaleFactor }
+        layoutDocumentView()
+        #if os(iOS)
+        if let scrollView {
+            let maxY = max(0, scrollView.contentSize.height - scrollView.bounds.height + scrollView.adjustedContentInset.bottom)
+            scrollView.setContentOffset(CGPoint(x: spot.offset.x, y: min(spot.offset.y, maxY)), animated: false)
+        }
+        #else
+        if let clip = documentView?.enclosingScrollView?.contentView {
+            clip.scroll(to: spot.offset)
+            documentView?.enclosingScrollView?.reflectScrolledClipView(clip)
+        }
         #endif
     }
 }

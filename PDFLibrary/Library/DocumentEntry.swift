@@ -44,6 +44,20 @@ struct Catalog: Codable, Sendable {
     var orphanPositions: [UUID: RemotePosition] = [:]
     /// Tombstones that iCloud has not confirmed yet.
     var pendingTombstones: Set<UUID> = []
+    /// Documents rebuilt from files after an unreadable catalog; held back until a full fetch.
+    var recoveredAwaitingFetch: Set<UUID> = []
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        documents = try c.decode([UUID: DocumentEntry].self, forKey: .documents)
+        tombstones = try c.decode([UUID: Date].self, forKey: .tombstones)
+        orphanPositions = try c.decode([UUID: RemotePosition].self, forKey: .orphanPositions)
+        pendingTombstones = try c.decode(Set<UUID>.self, forKey: .pendingTombstones)
+        recoveredAwaitingFetch = try c.decodeIfPresent(Set<UUID>.self, forKey: .recoveredAwaitingFetch) ?? []
+    }
 }
 
 struct RemotePosition: Codable, Hashable, Sendable {

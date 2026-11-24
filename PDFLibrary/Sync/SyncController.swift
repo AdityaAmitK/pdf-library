@@ -64,7 +64,12 @@ final class SyncController {
         accountObserver = NotificationCenter.default.addObserver(
             forName: .CKAccountChanged, object: nil, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in await self?.refreshAccount() }
+            Task { @MainActor in
+                // The account may have changed: stop syncing the current library until the new identity
+                // is confirmed.
+                self?.tearDownEngine()
+                await self?.refreshAccount()
+            }
         }
         pathMonitor.pathUpdateHandler = { [weak self] path in
             let online = path.status == .satisfied
@@ -118,10 +123,16 @@ final class SyncController {
 
     func refreshAccount() async {
         guard let container else { return }
+        // Only the newest lookup may change the library: an older one finishing late (after an account
+        // switch) must not reactivate the previous account's library.
+        accountGeneration += 1
+        let generation = accountGeneration
         let accountStatus: CKAccountStatus
         do {
             accountStatus = try await container.accountStatus()
+            guard generation == accountGeneration else { return }
         } catch {
+            guard generation == accountGeneration else { return }
             log.error("Account status failed: \(error.localizedDescription, privacy: .public)")
             // Keep the current library; this is usually transient.
             if engine == nil { status = .error(error.localizedDescription) }
@@ -134,9 +145,11 @@ final class SyncController {
             // library can never be sent to a different account's database.
             do {
                 let recordName = try await container.userRecordID().recordName
+                guard generation == accountGeneration else { return }
                 activate(scope: Self.scope(forAccount: recordName))
                 status = .available
             } catch {
+                guard generation == accountGeneration else { return }
                 tearDownEngine()
                 log.error("User record ID failed: \(String(describing: error), privacy: .public)")
                 if let ck = error as? CKError, [.networkUnavailable, .networkFailure].contains(ck.code) {
@@ -165,6 +178,8 @@ final class SyncController {
     }
 
     @ObservationIgnored private var accountRetry: Task<Void, Never>?
+    @ObservationIgnored private var accountGeneration = 0
+    @ObservationIgnored private var downloadRetry: Task<Void, Never>?
 
     private func scheduleAccountRetry() {
         guard accountRetry == nil else { return }
@@ -310,6 +325,13 @@ final class SyncController {
         } catch {
             if isTransient(error) {
                 library.setDownloadError(id, nil)
+                if let seconds = (error as? CKError)?.retryAfterSeconds, downloadRetry == nil {
+                    downloadRetry = Task { [weak self] in
+                        try? await Task.sleep(for: .seconds(seconds))
+                        self?.downloadRetry = nil
+                        self?.retryDownloads()
+                    }
+                }
             } else {
                 library.setDownloadError(id, error.localizedDescription)
             }
@@ -408,6 +430,9 @@ extension SyncController: CKSyncEngineDelegate {
 
         case .didFetchChanges:
             isSyncing = false
+            for id in library.releaseRecovered() {
+                if let pending = library.entry(id)?.pending { libraryNeedsSave(id, records: pending) }
+            }
             retryDownloads()
 
         case .didSendChanges:

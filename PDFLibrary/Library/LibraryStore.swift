@@ -125,10 +125,18 @@ final class LibraryStore {
             catalog.documents[id] = DocumentEntry(
                 id: id, title: "Recovered PDF", titleModifiedAt: .distantPast, createdAt: created,
                 byteSize: size, sha256: sha, pageCount: pageCount, pageIndex: 0, pageModifiedAt: nil,
-                fileInCloud: false, pending: [.metadata, .file])
+                fileInCloud: false, pending: [])
+            // Nothing is sent for it until a full fetch has applied the server's titles, positions and
+            // tombstones; then whatever the server lacks is uploaded (see `releaseRecovered`).
+            catalog.recoveredAwaitingFetch.insert(id)
             recovered = true
         }
-        if recovered { save() }
+        if recovered {
+            // Fetch everything again: drop the change token and cached change tags of the lost catalog.
+            try? fm.removeItem(at: paths.syncStateURL)
+            try? fm.removeItem(at: paths.recordMetadataURL)
+            save()
+        }
     }
 
     private func cleanStaging() {
@@ -259,7 +267,12 @@ final class LibraryStore {
                     if !localFiles.contains(existing.id) {
                         // Known document whose bytes haven't downloaded yet: use these (same checksum).
                         do {
-                            try FileManager.default.moveItem(at: prepared.stagedURL, to: paths.fileURL(for: existing.id))
+                            let target = paths.fileURL(for: existing.id)
+                            if FileManager.default.fileExists(atPath: target.path) {
+                                _ = try FileManager.default.replaceItemAt(target, withItemAt: prepared.stagedURL)
+                            } else {
+                                try FileManager.default.moveItem(at: prepared.stagedURL, to: target)
+                            }
                             localFiles.insert(existing.id)
                             setDownloadError(existing.id, nil)
                         } catch {
@@ -315,6 +328,7 @@ final class LibraryStore {
               let source = try? JSONDecoder().decode(Catalog.self, from: data),
               !source.documents.isEmpty else { return }
         let fm = FileManager.default
+        defer { mergedIDs = [] }
         var adopted: [UUID] = []
         var redundant: [UUID] = []   // already in this library (same bytes): the local copy can go
         for (id, var entry) in source.documents {
@@ -336,7 +350,10 @@ final class LibraryStore {
                 redundant.append(id)
                 continue
             }
-            guard catalog.tombstones[id] == nil else { continue }
+            guard catalog.tombstones[id] == nil else {
+                redundant.append(id)  // deleted in this account: deletion wins over the signed-out copy
+                continue
+            }
             let destination = paths.fileURL(for: id)
             do {
                 if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
@@ -350,7 +367,7 @@ final class LibraryStore {
             localFiles.insert(id)
             adopted.append(id)
         }
-        guard !adopted.isEmpty || !redundant.isEmpty else { mergedIDs = []; return }
+        guard !adopted.isEmpty || !redundant.isEmpty else { return }
         guard save() else {
             for id in adopted {
                 catalog.documents[id] = nil
@@ -360,14 +377,18 @@ final class LibraryStore {
             return
         }
         var remaining = source
-        for id in adopted + redundant { remaining.documents[id] = nil }
+        for id in adopted + redundant {
+            remaining.documents[id] = nil
+            // Marks the bytes as transferred, so an interrupted cleanup deletes them at next launch instead
+            // of recovering them into the signed-out library (and adopting them into another account).
+            remaining.tombstones[id] = Date()
+        }
         if let data = try? JSONEncoder().encode(remaining), (try? data.write(to: other.catalogURL, options: [.atomic])) != nil {
             for id in adopted + redundant { try? fm.removeItem(at: other.fileURL(for: id)) }
         }
         for id in adopted + mergedIDs {
             if let pending = catalog.documents[id]?.pending { changeSink?.libraryNeedsSave(id, records: pending) }
         }
-        mergedIDs = []
     }
 
     @ObservationIgnored private var mergedIDs: [UUID] = []
@@ -413,6 +434,23 @@ final class LibraryStore {
         save()
     }
 
+    /// After a full fetch: recovered documents the server didn't delete are uploaded if it lacks them.
+    func releaseRecovered() -> [UUID] {
+        let ids = catalog.recoveredAwaitingFetch
+        guard !ids.isEmpty else { return [] }
+        catalog.recoveredAwaitingFetch = []
+        var released: [UUID] = []
+        for id in ids {
+            guard var entry = catalog.documents[id] else { continue }
+            if entry.titleModifiedAt == .distantPast { entry.pending.insert(.metadata) }
+            if !entry.fileInCloud, localFiles.contains(id) { entry.pending.insert(.file) }
+            catalog.documents[id] = entry
+            if !entry.pending.isEmpty { released.append(id) }
+        }
+        save()
+        return released
+    }
+
     func markPending(_ id: UUID, records: PendingRecords) {
         guard var entry = catalog.documents[id] else { return }
         entry.pending.formUnion(records)
@@ -445,8 +483,11 @@ final class LibraryStore {
 
     /// Marks every record as needing a save, e.g. after iCloud data was reset.
     func markAllPending() {
-        for id in catalog.documents.keys {
-            catalog.documents[id]?.pending = .all
+        for (id, entry) in catalog.documents {
+            var pending: PendingRecords = .metadata
+            if entry.pageModifiedAt != nil { pending.insert(.position) }
+            if localFiles.contains(id) { pending.insert(.file) }
+            catalog.documents[id]?.pending = pending
             catalog.documents[id]?.fileInCloud = false
         }
         catalog.pendingTombstones.formUnion(catalog.tombstones.keys)
@@ -457,8 +498,11 @@ final class LibraryStore {
     func removeAllDocuments() {
         let ids = Array(catalog.documents.keys)
         catalog = Catalog()
+        // Local-only tombstones (not sent): a file whose removal fails is deleted at next launch rather
+        // than recovered.
+        for id in ids { catalog.tombstones[id] = Date() }
         localFiles = []
-        guard save() else { return }  // files stay; unreferenced ones are removed at next launch
+        guard save() else { return }
         for id in ids {
             try? FileManager.default.removeItem(at: paths.fileURL(for: id))
         }

@@ -65,6 +65,9 @@ struct DarkPageBuilder {
             return .scan
         }
 
+        if rewritten.textOnLightPage {
+            return .unsupported("Its text sits on a light background that keeps its color.")
+        }
         let contentsNumber = writer.addStream(dictionary: Data(), data: rewritten.data)
         var pageObject = Data("<< /Type /Page /Parent 2 0 R".utf8)
         pageObject.append(Data(" /MediaBox \(rectArray(mediaBox)) /CropBox \(rectArray(cropBox))".utf8))
