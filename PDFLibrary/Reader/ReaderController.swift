@@ -148,20 +148,38 @@ final class ReaderController {
         applyBackground()
         refreshNote()
         guard let view = pdfView, view.document != nil else { return }
+        let pageIndex = currentPage
         let destination = view.currentDestination
         let autoScales = view.autoScales
         let scale = view.scaleFactor
-        moveProgrammatically {
-            // PDFKit caches drawn page tiles; reattaching the document is the supported way to redraw them.
-            view.document = nil
-            view.document = document
-            if autoScales {
-                view.autoScales = true
-            } else {
-                view.scaleFactor = scale
+        func returnToSpot() {
+            if let destination, let page = destination.page, document.index(for: page) == pageIndex {
+                view.go(to: destination)
+            } else if let page = document.page(at: pageIndex) {
+                view.go(to: page)
             }
+        }
+        // PDFKit caches drawn page tiles; reattaching the document is the supported way to redraw them.
+        // PDFKit re-lays out the reattached document over the next run loop passes (and may scroll while
+        // doing so), so the spot is re-asserted after that and page changes are ignored until it settles.
+        programmaticMoves += 1
+        view.document = nil
+        view.document = document
+        if autoScales {
+            view.autoScales = true
+        } else {
+            view.scaleFactor = scale
+        }
+        view.layoutDocumentView()
+        returnToSpot()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [self] in
             view.layoutDocumentView()
-            if let destination { view.go(to: destination) }
+            if visiblePageIndex != pageIndex { returnToSpot() }
+            DispatchQueue.main.async { [self] in
+                currentPage = visiblePageIndex ?? pageIndex
+                refreshNote()
+                programmaticMoves -= 1
+            }
         }
     }
 
