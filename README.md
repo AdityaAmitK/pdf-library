@@ -57,6 +57,8 @@ To use iCloud sync with your own team, change `DEVELOPMENT_TEAM`, the bundle ide
 - Forced dark mode: [docs/DARK_MODE.md](docs/DARK_MODE.md)
 - Device test checklist: [docs/RUNBOOK.md](docs/RUNBOOK.md)
 
+iCloud sync has been checked live between an iPhone and a Mac (a PDF and its reading position). The full multi-device checklist is in [docs/RUNBOOK.md](docs/RUNBOOK.md).
+
 Screenshots use a synthetic sample PDF. They come from a simulator build without iCloud, which is why the footer says sync is unavailable.
 
 ## License

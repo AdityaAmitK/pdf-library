@@ -28,6 +28,7 @@ final class ReaderController {
     @ObservationIgnored private var programmaticMoves = 0
     /// The reader has moved since opening; remote positions no longer move the view.
     @ObservationIgnored private var userNavigated = false
+    @ObservationIgnored private var toggleGeneration = 0
 
     init?(id: UUID, library: LibraryStore, forcedDark: Bool) {
         guard let document = ReaderDocument(fileURL: library.fileURL(id), forcedDark: forcedDark),
@@ -155,16 +156,23 @@ final class ReaderController {
         // page changes are ignored until PDFKit has settled.
         let spot = view.scrollSpot
         let pageIndex = currentPage
+        toggleGeneration += 1
+        let generation = toggleGeneration
         programmaticMoves += 1
         view.document = nil
         view.document = document
         view.restore(spot)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [self] in
-            view.restore(spot)
-            DispatchQueue.main.async { [self] in
-                currentPage = visiblePageIndex ?? pageIndex
-                refreshNote()
-                programmaticMoves -= 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self else { return }
+            // A newer toggle restores its own spot; this one only balances the move counter.
+            if generation == self.toggleGeneration, self.pdfView === view { view.restore(spot) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if generation == self.toggleGeneration {
+                    self.currentPage = self.visiblePageIndex ?? pageIndex
+                    self.refreshNote()
+                }
+                self.programmaticMoves -= 1
             }
         }
     }

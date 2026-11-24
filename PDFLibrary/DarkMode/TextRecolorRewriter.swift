@@ -123,6 +123,8 @@ struct TextRecolorRewriter {
     /// Page box in default user space, used to recognise a full-page light background. Nil for form XObjects,
     /// whose coordinate system depends on where they are drawn.
     var pageBox: CGRect?
+    /// Area that light-box checks measure against: the page box, or a form XObject's /BBox.
+    var lightBoxReference: CGRect? = nil
 
     private struct GraphicsState {
         var ctm = CGAffineTransform.identity
@@ -232,7 +234,9 @@ struct TextRecolorRewriter {
             let isBackground = paint.map {
                 !paintedSomething && !gs.clipped && isFullPageLightBackground(pathOps, paint: $0, gs: gs)
             } ?? false
-            if pathOps.contains(where: { $0.name == "W" || $0.name == "W*" }) { gs.clipped = true }
+            // A clip to the whole page (common before a page fill) doesn't hide the background.
+            if pathOps.contains(where: { $0.name == "W" || $0.name == "W*" }),
+               !isFullPageRect(pathOps, gs: gs) { gs.clipped = true }
             if let paint, paint.name != "n" { paintedSomething = true }
             if let paint, !isBackground, isSizeableLightBox(pathOps, paint: paint, gs: gs, minimumShare: 0.02) {
                 lightBoxPainted = true
@@ -411,13 +415,34 @@ struct TextRecolorRewriter {
     /// table cell) that keeps its color, so light text drawn on it may be hard to read.
     private func isSizeableLightBox(_ path: [ContentOperation], paint: ContentOperation, gs: GraphicsState,
                                     minimumShare: Double) -> Bool {
-        guard let pageBox, ["f", "F", "f*", "B", "B*", "b", "b*"].contains(paint.name),
+        guard let reference = lightBoxReference ?? pageBox, ["f", "F", "f*", "B", "B*", "b", "b*"].contains(paint.name),
               let (r, g, b) = gs.fill.rgb, 0.2126 * r + 0.7152 * g + 0.0722 * b >= 0.8 else { return false }
-        let area = path.filter { $0.name == "re" && $0.numbers.count == 4 }.reduce(0.0) { total, op in
+        // Rectangles, plus the bounding box of any other filled path (a page fill drawn with m/l/h).
+        var area = 0.0
+        var points: [CGPoint] = []
+        for op in path {
             let n = op.numbers
-            let rect = CGRect(x: n[0], y: n[1], width: n[2], height: n[3]).standardized.applying(gs.ctm)
-            return total + rect.width * rect.height
+            if op.name == "re", n.count == 4 {
+                let rect = CGRect(x: n[0], y: n[1], width: n[2], height: n[3]).standardized.applying(gs.ctm)
+                area += rect.width * rect.height
+            } else if ["m", "l", "c", "v", "y"].contains(op.name) {
+                for i in stride(from: 0, to: n.count - 1, by: 2) {
+                    points.append(CGPoint(x: n[i], y: n[i + 1]).applying(gs.ctm))
+                }
+            }
         }
-        return area >= minimumShare * pageBox.width * pageBox.height
+        if let minX = points.map(\.x).min(), let maxX = points.map(\.x).max(),
+           let minY = points.map(\.y).min(), let maxY = points.map(\.y).max() {
+            area += (maxX - minX) * (maxY - minY)
+        }
+        return area >= minimumShare * reference.width * reference.height
+    }
+
+    private func isFullPageRect(_ path: [ContentOperation], gs: GraphicsState) -> Bool {
+        let rects = path.filter { $0.name == "re" && $0.numbers.count == 4 }
+        guard let pageBox, rects.count == 1, abs(gs.ctm.b) < 1e-6, abs(gs.ctm.c) < 1e-6 else { return false }
+        let n = rects[0].numbers
+        let covered = CGRect(x: n[0], y: n[1], width: n[2], height: n[3]).standardized.applying(gs.ctm).intersection(pageBox)
+        return !covered.isNull && covered.width * covered.height >= 0.98 * pageBox.width * pageBox.height
     }
 }

@@ -135,7 +135,10 @@ final class SyncController {
             guard generation == accountGeneration else { return }
             log.error("Account status failed: \(error.localizedDescription, privacy: .public)")
             // Keep the current library; this is usually transient.
-            if engine == nil { status = .error(error.localizedDescription) }
+            if engine == nil {
+                status = .error(error.localizedDescription)
+                scheduleAccountRetry()
+            }
             return
         }
         switch accountStatus {
@@ -172,6 +175,7 @@ final class SyncController {
             status = .temporarilyUnavailable
         case .couldNotDetermine:
             status = .error("iCloud status couldn't be determined.")
+            if engine == nil { scheduleAccountRetry() }
         @unknown default:
             status = .error("Unknown iCloud status.")
         }
@@ -180,6 +184,8 @@ final class SyncController {
     @ObservationIgnored private var accountRetry: Task<Void, Never>?
     @ObservationIgnored private var accountGeneration = 0
     @ObservationIgnored private var downloadRetry: Task<Void, Never>?
+    @ObservationIgnored private var downloadGeneration = 0
+    private static let adoptionTargetKey = "pendingAdoptionTarget"
 
     private func scheduleAccountRetry() {
         guard accountRetry == nil else { return }
@@ -201,9 +207,14 @@ final class SyncController {
         let previousScope = library.paths.scope
         library.switchScope(to: scope)
         UserDefaults.standard.set(scope, forKey: Self.activeScopeKey)
-        if previousScope == LibraryPaths.localScope {
-            // PDFs imported while signed out join the first iCloud library that becomes available.
-            library.adopt(from: LibraryPaths(scope: LibraryPaths.localScope))
+        // PDFs imported while signed out join the first iCloud library that becomes available. The target
+        // is recorded first, so an interrupted adoption resumes into the same account on the next launch.
+        let defaults = UserDefaults.standard
+        if previousScope == LibraryPaths.localScope { defaults.set(scope, forKey: Self.adoptionTargetKey) }
+        if defaults.string(forKey: Self.adoptionTargetKey) == scope {
+            if library.adopt(from: LibraryPaths(scope: LibraryPaths.localScope)) {
+                defaults.removeObject(forKey: Self.adoptionTargetKey)
+            }
         }
 
         let paths = library.paths
@@ -239,6 +250,9 @@ final class SyncController {
     }
 
     private func tearDownEngine() {
+        downloadGeneration += 1
+        downloadRetry?.cancel()
+        downloadRetry = nil
         downloadTask?.cancel()
         downloadTask = nil
         downloadsInFlight = []
@@ -290,8 +304,10 @@ final class SyncController {
         }
         guard downloadTask == nil, let container, engine != nil, isOnline else { return }
         let database = container.privateCloudDatabase
+        downloadGeneration += 1
+        let generation = downloadGeneration
         downloadTask = Task { [weak self] in
-            defer { self?.downloadTask = nil }
+            defer { if self?.downloadGeneration == generation { self?.downloadTask = nil } }
             // One attempt per missing document per pass, oldest first; failures wait for the next trigger.
             var attempted: Set<UUID> = []
             while let self, !Task.isCancelled {

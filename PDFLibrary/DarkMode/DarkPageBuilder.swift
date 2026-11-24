@@ -65,7 +65,7 @@ struct DarkPageBuilder {
             return .scan
         }
 
-        if rewritten.textOnLightPage {
+        if rewritten.textOnLightPage || writer.formsTextOnLightPage {
             return .unsupported("Its text sits on a light background that keeps its color.")
         }
         let contentsNumber = writer.addStream(dictionary: Data(), data: rewritten.data)
@@ -78,7 +78,7 @@ struct DarkPageBuilder {
             pageObject.append(writer.serialize(object: group, depth: 0))
         }
         pageObject.append(Data(" /Contents \(contentsNumber) 0 R >>".utf8))
-        return .derived(writer.document(pageObject: pageObject), lowContrastNote: rewritten.textAfterLightBox)
+        return .derived(writer.document(pageObject: pageObject), lowContrastNote: rewritten.textAfterLightBox || writer.formsTextAfterLightBox)
     }
 
     // MARK: Page helpers
@@ -225,6 +225,8 @@ private struct ObjectWriter {
     var formsHaveVisibleText = false
     var sawImage = false
     var usesOptionalContent = false
+    var formsTextAfterLightBox = false
+    var formsTextOnLightPage = false
     /// Copy whole resource dictionaries instead of only the names the content uses.
     var copyAllResources = false
     /// A form XObject without its own /Resources (it uses the page's), so the page's names aren't enough.
@@ -485,9 +487,10 @@ private struct ObjectWriter {
     private mutating func rewriteForm(_ data: Data, dict: CGPDFDictionaryRef) -> (Data, [String: Set<String>]) {
         var resources: CGPDFDictionaryRef?
         let formResources = CGPDFDictionaryGetDictionary(dict, "Resources", &resources) ? resources : pageResources
-        let rewriter = TextRecolorRewriter(
+        var rewriter = TextRecolorRewriter(
             resolveColorSpace: { ColorSpaceResolver.resolve($0, resources: formResources) },
             pageBox: nil)
+        rewriter.lightBoxReference = Self.bbox(dict)
         guard let result = try? rewriter.rewrite(data) else {
             unsupported = "A drawing group on this page couldn't be read."
             return (data, [:])
@@ -496,9 +499,19 @@ private struct ObjectWriter {
             unsupported = "This page uses Type 3 font glyphs that set their own colors."
         }
         if result.hasVisibleText { formsHaveVisibleText = true }
+        if result.textAfterLightBox { formsTextAfterLightBox = true }
+        if result.textOnLightPage { formsTextOnLightPage = true }
         if result.drawsInlineImage { sawImage = true }
         if result.usesOptionalContent { usesOptionalContent = true }
         return (result.data, result.usedResources)
+    }
+
+    private static func bbox(_ dict: CGPDFDictionaryRef) -> CGRect? {
+        var array: CGPDFArrayRef?
+        guard CGPDFDictionaryGetArray(dict, "BBox", &array), let array, CGPDFArrayGetCount(array) == 4 else { return nil }
+        var v = [CGPDFReal](repeating: 0, count: 4)
+        for i in 0..<4 { CGPDFArrayGetNumber(array, i, &v[i]) }
+        return CGRect(x: min(v[0], v[2]), y: min(v[1], v[3]), width: abs(v[2] - v[0]), height: abs(v[3] - v[1]))
     }
 
     private static func isForm(_ dict: CGPDFDictionaryRef) -> Bool {

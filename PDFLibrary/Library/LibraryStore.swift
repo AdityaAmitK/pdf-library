@@ -80,6 +80,9 @@ final class LibraryStore {
                 // Keep the unreadable catalog aside; the PDFs stay and are recovered below.
                 let aside = paths.root.appending(path: "catalog-unreadable-\(Int(Date().timeIntervalSince1970)).json")
                 try? FileManager.default.moveItem(at: paths.catalogURL, to: aside)
+                // Everything must be fetched again, even with no local files to recover.
+                try? FileManager.default.removeItem(at: paths.syncStateURL)
+                try? FileManager.default.removeItem(at: paths.recordMetadataURL)
                 catalog = Catalog()
                 notice = .error("The library catalog was unreadable and was set aside. Your PDFs were kept; titles and pages may need restoring from iCloud.")
             }
@@ -323,10 +326,13 @@ final class LibraryStore {
     /// Used when iCloud becomes available, so PDFs imported while signed out join the account library.
     /// Files are copied first and removed from the local library only after this catalog is safely written,
     /// so a failure at any point leaves every PDF reachable from at least one library.
-    func adopt(from other: LibraryPaths) {
-        guard let data = try? Data(contentsOf: other.catalogURL),
-              let source = try? JSONDecoder().decode(Catalog.self, from: data),
-              !source.documents.isEmpty else { return }
+    /// Returns true once the signed-out library holds nothing left to transfer (so the pending adoption
+    /// target can be cleared); false if anything must be retried on a later activation.
+    @discardableResult
+    func adopt(from other: LibraryPaths) -> Bool {
+        guard let data = try? Data(contentsOf: other.catalogURL) else { return true }  // nothing signed out
+        guard let source = try? JSONDecoder().decode(Catalog.self, from: data) else { return false }
+        guard !source.documents.isEmpty else { return true }
         let fm = FileManager.default
         defer { mergedIDs = [] }
         var adopted: [UUID] = []
@@ -367,14 +373,14 @@ final class LibraryStore {
             localFiles.insert(id)
             adopted.append(id)
         }
-        guard !adopted.isEmpty || !redundant.isEmpty else { return }
+        guard !adopted.isEmpty || !redundant.isEmpty else { return false }
         guard save() else {
             for id in adopted {
                 catalog.documents[id] = nil
                 localFiles.remove(id)
                 try? fm.removeItem(at: paths.fileURL(for: id))
             }
-            return
+            return false
         }
         var remaining = source
         for id in adopted + redundant {
@@ -383,12 +389,15 @@ final class LibraryStore {
             // of recovering them into the signed-out library (and adopting them into another account).
             remaining.tombstones[id] = Date()
         }
+        var sourceCleaned = false
         if let data = try? JSONEncoder().encode(remaining), (try? data.write(to: other.catalogURL, options: [.atomic])) != nil {
             for id in adopted + redundant { try? fm.removeItem(at: other.fileURL(for: id)) }
+            sourceCleaned = true
         }
         for id in adopted + mergedIDs {
             if let pending = catalog.documents[id]?.pending { changeSink?.libraryNeedsSave(id, records: pending) }
         }
+        return sourceCleaned && remaining.documents.isEmpty
     }
 
     @ObservationIgnored private var mergedIDs: [UUID] = []
@@ -498,8 +507,9 @@ final class LibraryStore {
     func removeAllDocuments() {
         let ids = Array(catalog.documents.keys)
         catalog = Catalog()
-        // Local-only tombstones (not sent): a file whose removal fails is deleted at next launch rather
-        // than recovered.
+        // Tombstones so a file whose removal fails is deleted at next launch rather than recovered. They
+        // aren't queued for upload, but if another device later re-sends one of these records, delete wins
+        // and the tombstone is sent then.
         for id in ids { catalog.tombstones[id] = Date() }
         localFiles = []
         guard save() else { return }
