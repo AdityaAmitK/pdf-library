@@ -105,6 +105,10 @@ struct TextRecolorRewriter {
     struct Result {
         var data: Data
         var hasVisibleText: Bool
+        /// Draws an inline image (`BI`…`EI`).
+        var drawsInlineImage: Bool
+        /// Uses optional content (`/OC … BDC`), whose visibility lives in the source document's catalog.
+        var usesOptionalContent: Bool
     }
 
     /// Resolves `/Name cs` color spaces against the stream's resources.
@@ -118,6 +122,15 @@ struct TextRecolorRewriter {
         var fill = TrackedColor()
         var stroke = TrackedColor()
         var renderMode = 0
+        var clipped = false
+    }
+
+    /// `Tr` operand: an integer 0…7. Anything else is a malformed stream (the page falls back to original).
+    private static func renderMode(_ op: ContentOperation) throws -> Int {
+        guard let value = op.numbers.first, value.isFinite, value >= 0, value <= 7, value == value.rounded() else {
+            throw ContentStreamError.malformed("invalid text render mode")
+        }
+        return Int(value)
     }
 
     func rewrite(_ data: Data) throws -> Result {
@@ -126,6 +139,10 @@ struct TextRecolorRewriter {
         let src = lexer.source
         var out = Data(capacity: data.count + data.count / 8)
         var hasVisibleText = false
+        var drawsInlineImage = false
+        var usesOptionalContent = false
+        /// Something has been painted; a later light rectangle is artwork, not the page background.
+        var paintedSomething = false
 
         var gs = GraphicsState()
         var stack: [GraphicsState] = []
@@ -133,9 +150,11 @@ struct TextRecolorRewriter {
         // Text object state
         var inText = false
         var block = Data()
+        var plainBlock = Data()   // the text object with its original colors
         var replay = Data()
         var blockUsesClip = false
         var colorsBeforeText = Data()
+        var colorsBeforeTextKnown = true
 
         // Path buffering (page level, outside text) to recognise a full-page light background fill.
         var pathStart: Int?
@@ -195,7 +214,12 @@ struct TextRecolorRewriter {
             let end = paint?.range.upperBound ?? pathOps.last?.range.upperBound ?? start
             var segment = Data(src[start..<end])
             segment.append(0x0A)
-            if let paint, isFullPageLightBackground(pathOps, paint: paint, gs: gs) {
+            let isBackground = paint.map {
+                !paintedSomething && !gs.clipped && isFullPageLightBackground(pathOps, paint: $0, gs: gs)
+            } ?? false
+            if pathOps.contains(where: { $0.name == "W" || $0.name == "W*" }) { gs.clipped = true }
+            if let paint, paint.name != "n" { paintedSomething = true }
+            if isBackground {
                 let s = DarkPalette.surface
                 out.append(Data(String(format: "q %.4f %.4f %.4f rg\n", s.r, s.g, s.b).utf8))
                 out.append(segment)
@@ -212,7 +236,12 @@ struct TextRecolorRewriter {
                 switch op.name {
                 case "ET":
                     block.append(raw(op))
-                    if blockUsesClip {
+                    plainBlock.append(raw(op))
+                    if blockUsesClip && !colorsBeforeTextKnown {
+                        // Clipping text in a form XObject whose color is inherited from the caller: the color
+                        // can't be restored after ET, so this text object keeps its original colors.
+                        out.append(plainBlock)
+                    } else if blockUsesClip {
                         // Text clipping must survive ET, so no q/Q: restore the colors from before BT, then
                         // replay the changes made inside the text object.
                         out.append(block)
@@ -226,24 +255,30 @@ struct TextRecolorRewriter {
                     }
                     inText = false
                 case "Tj", "TJ", "'":
-                    if gs.renderMode != 3 && gs.renderMode != 7 { hasVisibleText = true }
+                    if gs.renderMode != 3 && gs.renderMode != 7 { hasVisibleText = true; paintedSomething = true }
                     block.append(raw(op))
+                    plainBlock.append(raw(op))
                 case "\"":
-                    if gs.renderMode != 3 && gs.renderMode != 7 { hasVisibleText = true }
+                    if gs.renderMode != 3 && gs.renderMode != 7 { hasVisibleText = true; paintedSomething = true }
                     block.append(raw(op))
+                    plainBlock.append(raw(op))
                     let n = op.numbers
                     if n.count >= 2 {
                         replay.append(Data(String(format: "%f Tw %f Tc\n", n[0], n[1]).utf8))
                     }
                 case "Tr":
-                    gs.renderMode = Int(op.numbers.first ?? 0)
+                    gs.renderMode = try Self.renderMode(op)
                     if gs.renderMode >= 4 { blockUsesClip = true }
                     block.append(raw(op))
+                    plainBlock.append(raw(op))
                     replay.append(raw(op))
                 case "Tc", "Tw", "Tz", "TL", "Tf", "Ts", "w", "J", "j", "M", "d", "ri", "i", "gs":
                     block.append(raw(op))
+                    plainBlock.append(raw(op))
                     replay.append(raw(op))
                 default:
+                    if op.name == "BDC", case .name("OC") = op.operands.first { usesOptionalContent = true }
+                    plainBlock.append(raw(op))
                     if let isFill = applyColorOp(op) {
                         replay.append(raw(op))
                         block.append(colorOverride(fill: isFill))
@@ -274,11 +309,13 @@ struct TextRecolorRewriter {
             case "BT":
                 inText = true
                 block = raw(op)
+                plainBlock = raw(op)
                 block.append(colorOverride(fill: true))
                 block.append(colorOverride(fill: false))
                 replay = Data()
                 blockUsesClip = gs.renderMode >= 4
-                // Page streams start black; form XObjects inherit an unknown color (left as is).
+                // Page streams start black; form XObjects inherit an unknown color from their caller.
+                colorsBeforeTextKnown = pageBox != nil || (!gs.fill.operators.isEmpty && !gs.stroke.operators.isEmpty)
                 colorsBeforeText = (gs.fill.operators.isEmpty && pageBox != nil ? Data("0 g\n".utf8) : gs.fill.operators)
                     + (gs.stroke.operators.isEmpty && pageBox != nil ? Data("0 G\n".utf8) : gs.stroke.operators)
                 continue
@@ -292,7 +329,14 @@ struct TextRecolorRewriter {
                     gs.ctm = CGAffineTransform(a: n[0], b: n[1], c: n[2], d: n[3], tx: n[4], ty: n[5]).concatenating(gs.ctm)
                 }
             case "Tr":
-                gs.renderMode = Int(op.numbers.first ?? 0)
+                gs.renderMode = try Self.renderMode(op)
+            case "Do", "sh":
+                paintedSomething = true
+            case "BI":
+                paintedSomething = true
+                drawsInlineImage = true
+            case "BDC":
+                if case .name("OC") = op.operands.first { usesOptionalContent = true }
             default:
                 _ = applyColorOp(op)
             }
@@ -306,7 +350,8 @@ struct TextRecolorRewriter {
             out.append(Data("ET\nQ\n".utf8))
             out.append(replay)
         }
-        return Result(data: out, hasVisibleText: hasVisibleText)
+        return Result(data: out, hasVisibleText: hasVisibleText, drawsInlineImage: drawsInlineImage,
+                      usesOptionalContent: usesOptionalContent)
     }
 
     /// A single rectangle, filled (not stroked) with a near-white color, covering most of the page: the

@@ -119,19 +119,15 @@ final class SyncController {
         }
         switch accountStatus {
         case .available:
-            let recordName: String?
+            // Sync only binds to a library after iCloud confirms whose account this is. Until then (e.g. an
+            // offline launch) the last library stays readable and importable locally, but nothing syncs, so a
+            // library can never be sent to a different account's database.
             do {
-                recordName = try await container.userRecordID().recordName
-                UserDefaults.standard.set(recordName, forKey: Self.lastAccountKey)
-            } catch {
-                // Offline launch: the account is unchanged unless iCloud said otherwise (the engine reports
-                // switches), so reuse the last known identity.
-                recordName = UserDefaults.standard.string(forKey: Self.lastAccountKey)
-            }
-            if let recordName {
+                let recordName = try await container.userRecordID().recordName
                 activate(scope: Self.scope(forAccount: recordName))
                 status = .available
-            } else {
+            } catch {
+                tearDownEngine()
                 status = .waitingForNetwork
             }
         case .noAccount:
@@ -245,6 +241,10 @@ final class SyncController {
     /// Requests every PDF whose bytes aren't on this device yet. Runs after each fetch, on reconnect, on
     /// launch and on Retry; failures stay visible per document until a later attempt succeeds.
     func retryDownloads() {
+        if engine == nil, status == .waitingForNetwork {
+            Task { await refreshAccount() }
+            return
+        }
         guard downloadTask == nil, let container, engine != nil, isOnline else { return }
         let database = container.privateCloudDatabase
         downloadTask = Task { [weak self] in
@@ -263,15 +263,17 @@ final class SyncController {
     }
 
     private func download(_ id: UUID, database: CKDatabase) async {
+        let owner = engine
         downloadsInFlight.insert(id)
         defer { downloadsInFlight.remove(id) }
         do {
             let record = try await database.record(for: CloudRecords.recordID(.file, id))
+            guard owner != nil, owner === engine else { return }  // account changed while fetching
             guard let asset = record["asset"] as? CKAsset, let url = asset.fileURL else {
                 library.setDownloadError(id, "The PDF in iCloud is missing its file.")
                 return
             }
-            if await library.installRemoteFile(id, from: url, sha256: record["sha256"] as? String) {
+            if await library.installRemoteFile(id, from: url, sha256: record["sha256"] as? String), owner === engine {
                 library.markSynced(id, records: .file)
             }
         } catch let error as CKError where error.code == .unknownItem {
@@ -353,6 +355,8 @@ extension SyncController: CKSyncEngineDelegate {
         case .fetchedRecordZoneChanges(let changes):
             for modification in changes.modifications {
                 await applyFetched(modification.record, syncEngine: syncEngine)
+                // Applying a file awaits a copy; the account (and library) may have changed meanwhile.
+                guard syncEngine === engine else { return }
             }
             for deletion in changes.deletions {
                 applyFetchedDeletion(deletion.recordID, syncEngine: syncEngine)
@@ -458,7 +462,8 @@ extension SyncController: CKSyncEngineDelegate {
             }
             guard let asset = record["asset"] as? CKAsset, let url = asset.fileURL else { return }
             // Copy now: CloudKit may remove its staging file once this event returns.
-            if await library.installRemoteFile(id, from: url, sha256: record["sha256"] as? String) {
+            if await library.installRemoteFile(id, from: url, sha256: record["sha256"] as? String),
+               syncEngine === engine {
                 library.markSynced(id, records: .file)
             }
         }
@@ -504,6 +509,16 @@ extension SyncController: CKSyncEngineDelegate {
         }
         for recordID in sent.deletedRecordIDs {
             metadata?.remove(recordID)
+        }
+        for (recordID, error) in sent.failedRecordDeletes where error.code != .unknownItem {
+            // A leftover file record of a deleted document would keep using iCloud storage: retry transient
+            // failures, and surface the rest (the next device to fetch the record deletes it again).
+            if isTransient(error) || error.code == .zoneBusy || error.code == .limitExceeded {
+                requeue.append(.deleteRecord(recordID))
+            } else {
+                log.error("Delete of \(recordID.recordName, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+                problem = error.localizedDescription
+            }
         }
 
         for failure in sent.failedRecordSaves {

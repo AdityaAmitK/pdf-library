@@ -37,17 +37,23 @@ final class ReaderPage: PDFPage {
         switch document.darkRenderer.rendering(forPage: index) {
         case .original:
             super.draw(with: box, to: context)
-        case .derived(let page):
-            let bounds = bounds(for: box)
+        case .derived(let derivedDocument, let page):
+            // PDFKit hands over a context in display space; map it to page space for this box, including
+            // /Rotate and a CropBox that doesn't start at the origin (super.draw does the same internally).
             context.saveGState()
+            transform(context, for: box)
+            let bounds = bounds(for: box)
             context.setFillColor(DarkPalette.surfaceColor)
             context.fill(bounds)
+            context.saveGState()
             context.clip(to: bounds)
             context.drawPDFPage(page)
             context.restoreGState()
             for annotation in annotations where annotation.shouldDisplay {
                 annotation.draw(with: box, in: context)
             }
+            context.restoreGState()
+            withExtendedLifetime(derivedDocument) {}
         }
     }
 }

@@ -11,7 +11,7 @@ The local library is the source of truth for reading. iCloud (CloudKit private d
 - `sync-state.plist`: `CKSyncEngine` state, including its pending changes.
 - `record-metadata.plist`: CloudKit system fields per record, so saves update records instead of conflicting.
 
-`<scope>` is `icloud-<hash of the iCloud user record ID>` per account, or `local` while signed out. Libraries of different accounts never mix. PDFs imported while signed out join the first account library that becomes available on that device. Signing out shows the (empty or signed-out) local library; the account library stays on disk and returns when the same account signs back in.
+`<scope>` is `icloud-<hash of the iCloud user record ID>` per account, or `local` while signed out. Sync binds to an account library only after iCloud confirms the account's identity; until then (for example an offline launch) the last library stays readable and importable on the device, but nothing is sent or received. Imports, downloads and fetched records that finish after the account changed are not applied to the new library. Libraries of different accounts never mix. PDFs imported while signed out join the first account library that becomes available on that device: they are copied in, and removed from the local library only after the account catalog is written. Signing out shows the (empty or signed-out) local library; the account library stays on disk and returns when the same account signs back in.
 
 ## Schema (private database, zone `Library`)
 

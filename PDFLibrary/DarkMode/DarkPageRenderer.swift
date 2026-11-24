@@ -4,7 +4,8 @@ import Foundation
 /// Produces and caches forced-dark versions of a document's pages. Safe to call from PDFKit's render threads.
 final class DarkPageRenderer: @unchecked Sendable {
     enum Rendering {
-        case derived(CGPDFPage)
+        /// The document is returned with its page so a cache eviction can't free it mid-draw.
+        case derived(CGPDFDocument, CGPDFPage)
         case original
     }
 
@@ -35,7 +36,7 @@ final class DarkPageRenderer: @unchecked Sendable {
         if unsupported.contains(index) { return .original }
         if let document = derived[index], let page = document.page(at: 1) {
             touch(index)
-            return .derived(page)
+            return .derived(document, page)
         }
         guard let source, let page = source.page(at: index + 1) else {
             return markUnsupported(index, "The page couldn't be read.")
@@ -47,10 +48,15 @@ final class DarkPageRenderer: @unchecked Sendable {
                   let derivedPage = document.page(at: 1) else {
                 return markUnsupported(index, "The recolored page couldn't be assembled.")
             }
-            if scanLike { notes[index] = .scan }
+            if scanLike {
+                // A scan has no PDF text to recolor: draw the original (no decoded-image copy in memory).
+                notes[index] = .scan
+                unsupported.insert(index)
+                return .original
+            }
             derived[index] = document
             touch(index)
-            return .derived(derivedPage)
+            return .derived(document, derivedPage)
         case .unsupported(let message):
             return markUnsupported(index, message)
         }

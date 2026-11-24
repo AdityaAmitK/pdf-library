@@ -98,7 +98,10 @@ final class LibraryStore {
 
     // MARK: Persistence
 
-    func save() {
+    /// Writes the catalog atomically. Returns false (and shows the error) if it couldn't be written; callers
+    /// must not delete files or publish changes to iCloud for state that isn't on disk.
+    @discardableResult
+    func save() -> Bool {
         saveTask?.cancel()
         saveTask = nil
         do {
@@ -106,8 +109,10 @@ final class LibraryStore {
             encoder.outputFormatting = [.sortedKeys]
             let data = try encoder.encode(catalog)
             try data.write(to: paths.catalogURL, options: [.atomic])
+            return true
         } catch {
             notice = .error("Couldn't save the library: \(error.localizedDescription)")
+            return false
         }
     }
 
@@ -158,12 +163,16 @@ final class LibraryStore {
 
     func delete(_ id: UUID) {
         guard catalog.documents[id] != nil else { return }
+        let before = catalog
         catalog.documents[id] = nil
         catalog.orphanPositions[id] = nil
         catalog.tombstones[id] = Date()
         catalog.pendingTombstones.insert(id)
+        guard save() else {
+            catalog = before  // the tombstone isn't durable: keep the document and its file
+            return
+        }
         positionsAwaitingSave.remove(id)
-        save()
         try? FileManager.default.removeItem(at: paths.fileURL(for: id))
         localFiles.remove(id)
         changeSink?.libraryNeedsTombstone(id)
@@ -177,10 +186,17 @@ final class LibraryStore {
         var duplicates: [String] = []
         for url in urls {
             let staging = paths.stagingDirectory
+            let scope = paths.scope
             do {
                 let prepared = try await Task.detached(priority: .userInitiated) {
                     try PDFImporter.prepare(url, stagingDirectory: staging)
                 }.value
+                guard paths.scope == scope else {
+                    // The iCloud account changed while the file was being read; don't add it to another library.
+                    try? FileManager.default.removeItem(at: prepared.stagedURL)
+                    failures.append("\(url.lastPathComponent): the iCloud account changed during import. Import it again.")
+                    continue
+                }
                 if let existing = catalog.documents.values.first(where: { $0.sha256 == prepared.sha256 }) {
                     try? FileManager.default.removeItem(at: prepared.stagedURL)
                     duplicates.append(existing.title)
@@ -211,38 +227,60 @@ final class LibraryStore {
             id: id, title: prepared.title, titleModifiedAt: now, createdAt: now,
             byteSize: prepared.byteSize, sha256: prepared.sha256, pageCount: prepared.pageCount,
             pageIndex: 0, pageModifiedAt: nil, fileInCloud: false, pending: .all)
+        guard save() else {
+            catalog.documents[id] = nil
+            try? FileManager.default.removeItem(at: paths.fileURL(for: id))
+            throw LibraryError.catalogNotSaved
+        }
         localFiles.insert(id)
-        save()
         changeSink?.libraryNeedsSave(id, records: .all)
     }
 
-    /// Moves every document of `other` (the signed-out local library) into this library and empties it.
-    /// Used once when iCloud becomes available, so PDFs imported while signed out join the account library.
+    /// Moves every document of `other` (the signed-out local library) into this library.
+    /// Used when iCloud becomes available, so PDFs imported while signed out join the account library.
+    /// Files are copied first and removed from the local library only after this catalog is safely written,
+    /// so a failure at any point leaves every PDF reachable from at least one library.
     func adopt(from other: LibraryPaths) {
         guard let data = try? Data(contentsOf: other.catalogURL),
               let source = try? JSONDecoder().decode(Catalog.self, from: data),
               !source.documents.isEmpty else { return }
-        var remaining = source
+        let fm = FileManager.default
+        var adopted: [UUID] = []
+        var redundant: [UUID] = []   // already in this library (same bytes): the local copy can go
         for (id, var entry) in source.documents {
-            defer { remaining.documents[id] = nil }
-            guard catalog.documents[id] == nil, catalog.tombstones[id] == nil,
-                  !catalog.documents.values.contains(where: { $0.sha256 == entry.sha256 }) else { continue }
-            do {
-                try FileManager.default.moveItem(at: other.fileURL(for: id), to: paths.fileURL(for: id))
-            } catch {
-                remaining.documents[id] = entry  // keep it in the local library rather than lose it
+            if catalog.documents[id] != nil || catalog.documents.values.contains(where: { $0.sha256 == entry.sha256 }) {
+                redundant.append(id)
                 continue
+            }
+            guard catalog.tombstones[id] == nil else { continue }
+            let destination = paths.fileURL(for: id)
+            do {
+                if fm.fileExists(atPath: destination.path) { try fm.removeItem(at: destination) }
+                try fm.copyItem(at: other.fileURL(for: id), to: destination)
+            } catch {
+                continue  // stays in the local library; adoption is retried next time
             }
             entry.fileInCloud = false
             entry.pending = .all
             catalog.documents[id] = entry
             localFiles.insert(id)
+            adopted.append(id)
         }
-        save()
-        if let data = try? JSONEncoder().encode(remaining) {
-            try? data.write(to: other.catalogURL, options: [.atomic])
+        guard !adopted.isEmpty || !redundant.isEmpty else { return }
+        guard save() else {
+            for id in adopted {
+                catalog.documents[id] = nil
+                localFiles.remove(id)
+                try? fm.removeItem(at: paths.fileURL(for: id))
+            }
+            return
         }
-        for id in source.documents.keys where catalog.documents[id]?.pending == .all {
+        var remaining = source
+        for id in adopted + redundant { remaining.documents[id] = nil }
+        if let data = try? JSONEncoder().encode(remaining), (try? data.write(to: other.catalogURL, options: [.atomic])) != nil {
+            for id in adopted + redundant { try? fm.removeItem(at: other.fileURL(for: id)) }
+        }
+        for id in adopted {
             changeSink?.libraryNeedsSave(id, records: .all)
         }
     }
@@ -381,9 +419,13 @@ final class LibraryStore {
         let destination = paths.fileURL(for: id)
         let staging = paths.stagingDirectory
         let expected = sha256 ?? catalog.documents[id]?.sha256
+        let scope = paths.scope
         let result = await Task.detached(priority: .utility) {
             try PDFImporter.installDownloaded(stagedURL, to: destination, stagingDirectory: staging, expectedSHA256: expected)
         }.result
+        // The file went into the library it was requested for; if the account changed meanwhile, the
+        // current library must not record it.
+        guard paths.scope == scope else { return false }
         switch result {
         case .success:
             // The document may have been deleted while the copy ran.
@@ -430,6 +472,7 @@ enum LibraryError: LocalizedError {
     case passwordProtected
     case empty
     case checksumMismatch
+    case catalogNotSaved
     case storage(Error)
 
     var errorDescription: String? {
@@ -438,6 +481,7 @@ enum LibraryError: LocalizedError {
         case .passwordProtected: "Password-protected PDFs aren't supported."
         case .empty: "This PDF has no pages."
         case .checksumMismatch: "The downloaded file was incomplete. It will be downloaded again."
+        case .catalogNotSaved: "The library couldn't be saved."
         case .storage(let error):
             if Self.isOutOfSpace(error) { "Not enough storage on this device." } else { error.localizedDescription }
         }

@@ -74,6 +74,8 @@ final class ReaderController {
         moveProgrammatically { [self] in
             if let page = document.page(at: clamp(saved)) { view.go(to: page) }
         }
+        // The restored page may equal the initial index, which posts no page change: load its note now.
+        refreshNote()
     }
 
     // MARK: Page tracking

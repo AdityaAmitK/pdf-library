@@ -22,7 +22,12 @@ struct DarkPageBuilder {
         let mediaBox = page.getBoxRect(.mediaBox)
         let cropBox = page.getBoxRect(.cropBox)
 
-        let contents = pageContents(pageDict)
+        guard let contents = pageContents(pageDict) else {
+            return .unsupported("The page's drawing instructions couldn't be decoded.")
+        }
+        if usesType3GlyphColors(resources) {
+            return .unsupported("This page uses Type 3 font glyphs that set their own colors.")
+        }
         let rewriter = TextRecolorRewriter(
             resolveColorSpace: { ColorSpaceResolver.resolve($0, resources: resources) },
             pageBox: cropBox)
@@ -36,7 +41,12 @@ struct DarkPageBuilder {
         writer.pageResources = resources
         let resourcesData = resources.map { writer.serialize(dictionary: $0, depth: 0) } ?? Data("<<>>".utf8)
         if let problem = writer.unsupported { return .unsupported(problem) }
-        let scanLike = !rewritten.hasVisibleText && !writer.formsHaveVisibleText && writer.sawImage
+        if rewritten.usesOptionalContent || writer.usesOptionalContent {
+            // Layer visibility lives in the source catalog; drawing a copy without it could show hidden layers.
+            return .unsupported("This page has optional layers.")
+        }
+        let scanLike = !rewritten.hasVisibleText && !writer.formsHaveVisibleText
+            && (writer.sawImage || rewritten.drawsInlineImage)
 
         let contentsNumber = writer.addStream(dictionary: Data(), data: rewritten.data)
         var pageObject = Data("<< /Type /Page /Parent 2 0 R".utf8)
@@ -81,22 +91,56 @@ struct DarkPageBuilder {
         return CGPDFDictionaryGetObject(dict, key, &object) ? object : nil
     }
 
-    private static func pageContents(_ dict: CGPDFDictionaryRef) -> Data {
+    /// The page's content streams, concatenated. Nil if any part can't be decoded (never drop content).
+    private static func pageContents(_ dict: CGPDFDictionaryRef) -> Data? {
         var stream: CGPDFStreamRef?
         if CGPDFDictionaryGetStream(dict, "Contents", &stream), let stream {
-            return decoded(stream) ?? Data()
+            return decoded(stream)
         }
         var array: CGPDFArrayRef?
-        guard CGPDFDictionaryGetArray(dict, "Contents", &array), let array else { return Data() }
+        guard CGPDFDictionaryGetArray(dict, "Contents", &array), let array else {
+            var object: CGPDFObjectRef?
+            return CGPDFDictionaryGetObject(dict, "Contents", &object) ? nil : Data()  // absent = empty page
+        }
         var data = Data()
         for i in 0..<CGPDFArrayGetCount(array) {
             var part: CGPDFStreamRef?
-            if CGPDFArrayGetStream(array, i, &part), let part, let bytes = decoded(part) {
-                data.append(bytes)
-                data.append(0x0A)
-            }
+            guard CGPDFArrayGetStream(array, i, &part), let part, let bytes = decoded(part) else { return nil }
+            data.append(bytes)
+            data.append(0x0A)
         }
         return data
+    }
+
+    /// Type 3 glyphs declared with `d0` paint in their own colors, which the recolorer doesn't rewrite.
+    private static func usesType3GlyphColors(_ resources: CGPDFDictionaryRef?) -> Bool {
+        guard let resources else { return false }
+        var fonts: CGPDFDictionaryRef?
+        guard CGPDFDictionaryGetDictionary(resources, "Font", &fonts), let fonts else { return false }
+        var found = false
+        withUnsafeMutablePointer(to: &found) { pointer in
+            CGPDFDictionaryApplyBlock(fonts, { _, value, info in
+                var font: CGPDFDictionaryRef?
+                var subtype: UnsafePointer<CChar>?
+                var procs: CGPDFDictionaryRef?
+                guard CGPDFObjectGetValue(value, .dictionary, &font), let font,
+                      CGPDFDictionaryGetName(font, "Subtype", &subtype), let subtype, String(cString: subtype) == "Type3",
+                      CGPDFDictionaryGetDictionary(font, "CharProcs", &procs), let procs else { return true }
+                CGPDFDictionaryApplyBlock(procs, { _, proc, info in
+                    var stream: CGPDFStreamRef?
+                    guard CGPDFObjectGetValue(proc, .stream, &stream), let stream,
+                          let data = DarkPageBuilder.decoded(stream) else { return true }
+                    var lexer = ContentStreamLexer(data)
+                    if let ops = try? lexer.operations(), ops.contains(where: { $0.name == "d0" }) {
+                        info?.assumingMemoryBound(to: Bool.self).pointee = true
+                        return false
+                    }
+                    return true
+                }, info)
+                return info?.assumingMemoryBound(to: Bool.self).pointee != true
+            }, pointer)
+        }
+        return found
     }
 
     static func decoded(_ stream: CGPDFStreamRef) -> Data? {
@@ -159,6 +203,7 @@ private struct ObjectWriter {
     var unsupported: String?
     var formsHaveVisibleText = false
     var sawImage = false
+    var usesOptionalContent = false
     var pageResources: CGPDFDictionaryRef?
 
     static func number(_ value: Double) -> String {
@@ -290,6 +335,8 @@ private struct ObjectWriter {
         }
         let filters = Self.filterNames(dict)
         if Self.subtype(dict) == "Image" { sawImage = true }
+        var optional: CGPDFDictionaryRef?
+        if CGPDFDictionaryGetDictionary(dict, "OC", &optional) { usesOptionalContent = true }
         if filters.contains("JBIG2Decode") || filters.contains("CCITTFaxDecode") {
             unsupported = "This page has a fax-encoded image that forced dark mode can't redraw."
         }
@@ -319,6 +366,11 @@ private struct ObjectWriter {
 
         var dictData = serialize(dictionary: dict, depth: depth + 1, skip: skip)
         // Drop the closing ">>" from the serialized dictionary; addStream-style framing adds Length.
+        guard dictData.count >= 2, dictData.suffix(2) == Data(">>".utf8) else {
+            unsupported = "An embedded object couldn't be copied."
+            objects[number] = Data("null".utf8)
+            return number
+        }
         dictData.removeLast(2)
         var object = dictData
         object.append(Data("\(extra) /Length \(data.count) >>\nstream\n".utf8))
@@ -339,6 +391,8 @@ private struct ObjectWriter {
             return data
         }
         if result.hasVisibleText { formsHaveVisibleText = true }
+        if result.drawsInlineImage { sawImage = true }
+        if result.usesOptionalContent { usesOptionalContent = true }
         return result.data
     }
 

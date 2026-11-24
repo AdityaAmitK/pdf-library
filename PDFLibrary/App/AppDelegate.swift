@@ -17,7 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // CKSyncEngine relies on pushes to learn about changes from other devices.
-        NSApplication.shared.registerForRemoteNotifications()
+        if SyncController.cloudSyncEnabled { NSApplication.shared.registerForRemoteNotifications() }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -43,7 +43,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         // CKSyncEngine relies on pushes to learn about changes from other devices.
-        application.registerForRemoteNotifications()
+        if SyncController.cloudSyncEnabled { application.registerForRemoteNotifications() }
         return true
     }
 }
