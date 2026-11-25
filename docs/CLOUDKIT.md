@@ -17,7 +17,7 @@ The local library is the source of truth for reading. iCloud (CloudKit private d
 
 | Record type | Record name | Fields | Changes |
 | --- | --- | --- | --- |
-| `Document` | `<uuid>` | `title` String, `titleModifiedAt` Date, `createdAt` Date, `byteSize` Int64, `sha256` String, `pageCount` Int64, `deleted` Int64, `deletedAt` Date | on rename, on delete (tombstone) |
+| `Document` | `<uuid>` | `title` String, `titleModifiedAt` Date, `createdAt` Date, `byteSize` Int64, `sha256` String, `pageCount` Int64, `deleted` Int64 (a tombstone stores its deletion time in `titleModifiedAt`) | on rename, on delete (tombstone) |
 | `PDFFile` | `file-<uuid>` | `asset` Asset, `sha256` String | once, at import |
 | `Position` | `pos-<uuid>` | `pageIndex` Int64, `pageModifiedAt` Date | at reading checkpoints |
 
