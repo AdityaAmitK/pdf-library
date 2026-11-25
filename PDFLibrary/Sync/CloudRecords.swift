@@ -64,7 +64,8 @@ enum CloudRecords {
 
     static func fillTombstone(_ record: CKRecord, deletedAt: Date) {
         record["deleted"] = Int64(1)
-        record["deletedAt"] = deletedAt
+        // Only fields the Production schema already has: CloudKit Production rejects new fields.
+        record["titleModifiedAt"] = deletedAt
         record["title"] = nil
     }
 }
