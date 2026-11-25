@@ -7,6 +7,7 @@ import Foundation
 ///         Files/<uuid>.pdf      durable PDF copies, the only source the reader opens
 ///         sync-state.plist      CKSyncEngine state, including pending changes
 ///         record-metadata.plist CloudKit system fields per record, for conflict-free saves
+///         sync-environment      CloudKit environment the two files above belong to
 ///
 /// Each iCloud account gets its own scope, so libraries never mix when the account changes.
 struct LibraryPaths: Sendable {
@@ -30,6 +31,8 @@ struct LibraryPaths: Sendable {
     var filesDirectory: URL { root.appending(path: "Files", directoryHint: .isDirectory) }
     var syncStateURL: URL { root.appending(path: "sync-state.plist") }
     var recordMetadataURL: URL { root.appending(path: "record-metadata.plist") }
+    /// CloudKit environment (Development or Production) that the sync state and metadata belong to.
+    var syncEnvironmentURL: URL { root.appending(path: "sync-environment") }
     var stagingDirectory: URL { root.appending(path: "Staging", directoryHint: .isDirectory) }
 
     func fileURL(for id: UUID) -> URL {

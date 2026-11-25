@@ -218,6 +218,7 @@ final class SyncController {
         }
 
         let paths = library.paths
+        resetSyncStateIfEnvironmentChanged(paths)
         metadata = RecordMetadataCache(url: paths.recordMetadataURL)
         var stateSerialization: CKSyncEngine.State.Serialization?
         if let data = try? Data(contentsOf: paths.syncStateURL) {
@@ -239,6 +240,23 @@ final class SyncController {
             try? await engine.fetchChanges()
             retryDownloads()
         }
+    }
+
+    /// Development and Production are separate databases with the same account and zone names. A build from
+    /// the other environment (a TestFlight install over an Xcode one, or back) must not reuse this device's
+    /// change tokens or system fields, and the other database has none of this library's records yet: start
+    /// the engine fresh and upload the whole library again. Merging by timestamp keeps this idempotent.
+    private func resetSyncStateIfEnvironmentChanged(_ paths: LibraryPaths) {
+        let current = Bundle.main.object(forInfoDictionaryKey: "PDFLCloudEnvironment") as? String ?? "Development"
+        // Sync state written before this file existed came from Xcode builds, which use Development.
+        let stored = (try? String(contentsOf: paths.syncEnvironmentURL, encoding: .utf8)) ?? "Development"
+        if stored != current {
+            log.notice("CloudKit environment changed from \(stored, privacy: .public) to \(current, privacy: .public); uploading library again")
+            try? FileManager.default.removeItem(at: paths.syncStateURL)
+            try? FileManager.default.removeItem(at: paths.recordMetadataURL)
+            library.markAllPending()
+        }
+        try? current.write(to: paths.syncEnvironmentURL, atomically: true, encoding: .utf8)
     }
 
     /// Signed out or restricted: stop syncing and show the signed-out local library. The account's library

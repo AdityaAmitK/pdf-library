@@ -39,6 +39,8 @@
 	<false/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<false/>
+	<key>PDFLCloudEnvironment</key>
+	<string>$(PDFL_CLOUD_ENVIRONMENT)</string>
 	<key>PDFLCloudSync</key>
 	<string>$(PDFL_CLOUD_SYNC)</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
